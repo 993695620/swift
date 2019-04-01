@@ -305,6 +305,7 @@ static StringRef getDefaultArgumentKindString(DefaultArgumentKind value) {
     case DefaultArgumentKind::EmptyArray: return "[]";
     case DefaultArgumentKind::EmptyDictionary: return "[:]";
     case DefaultArgumentKind::Normal: return "normal";
+    case DefaultArgumentKind::StoredProperty: return "stored property";
   }
 
   llvm_unreachable("Unhandled DefaultArgumentKind in switch.");
@@ -1331,6 +1332,10 @@ void swift::printContext(raw_ostream &os, DeclContext *dc) {
   case DeclContextKind::SubscriptDecl:
     printName(os, cast<SubscriptDecl>(dc)->getFullName());
     break;
+
+  case DeclContextKind::EnumElementDecl:
+    printName(os, cast<EnumElementDecl>(dc)->getFullName());
+    break;
   }
 }
 
@@ -1436,7 +1441,8 @@ public:
           cast<PlatformVersionConstraintAvailabilitySpec>(Query)->print(OS, Indent + 2);
           break;
         case AvailabilitySpecKind::LanguageVersionConstraint:
-          cast<LanguageVersionConstraintAvailabilitySpec>(Query)->print(OS, Indent + 2);
+        case AvailabilitySpecKind::PackageDescriptionVersionConstraint:
+          cast<PlatformVersionConstraintAvailabilitySpec>(Query)->print(OS, Indent + 2);
           break;
         case AvailabilitySpecKind::OtherPlatform:
           cast<OtherPlatformAvailabilitySpec>(Query)->print(OS, Indent + 2);
@@ -1614,6 +1620,24 @@ public:
     printCommon(S, "case_stmt");
     if (S->hasUnknownAttr())
       OS << " @unknown";
+
+    if (auto caseBodyVars = S->getCaseBodyVariables()) {
+      OS << '\n';
+      OS.indent(Indent + 2);
+      PrintWithColorRAII(OS, ParenthesisColor) << '(';
+      PrintWithColorRAII(OS, StmtColor) << "case_body_variables";
+      OS << '\n';
+      for (auto *vd : *caseBodyVars) {
+        OS.indent(2);
+        // TODO: Printing a var decl does an Indent ... dump(vd) ... '\n'. We
+        // should see if we can factor this dumping so that the caller of
+        // printRec(VarDecl) has more control over the printing.
+        printRec(vd);
+      }
+      OS.indent(Indent + 2);
+      PrintWithColorRAII(OS, ParenthesisColor) << ')';
+    }
+
     for (const auto &LabelItem : S->getCaseLabelItems()) {
       OS << '\n';
       OS.indent(Indent + 2);
@@ -1800,6 +1824,8 @@ public:
 
   void visitNilLiteralExpr(NilLiteralExpr *E) {
     printCommon(E, "nil_literal_expr");
+    PrintWithColorRAII(OS, LiteralValueColor) << " initializer=";
+    E->getInitializer().dump(PrintWithColorRAII(OS, LiteralValueColor).getOS());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -1813,19 +1839,41 @@ public:
       PrintWithColorRAII(OS, LiteralValueColor) << E->getDigitsText();
     else
       PrintWithColorRAII(OS, LiteralValueColor) << E->getValue();
+    PrintWithColorRAII(OS, LiteralValueColor) << " builtin_initializer=";
+    E->getBuiltinInitializer().dump(
+        PrintWithColorRAII(OS, LiteralValueColor).getOS());
+    PrintWithColorRAII(OS, LiteralValueColor) << " initializer=";
+    E->getInitializer().dump(PrintWithColorRAII(OS, LiteralValueColor).getOS());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
   void visitFloatLiteralExpr(FloatLiteralExpr *E) {
     printCommon(E, "float_literal_expr");
+    if (E->isNegative())
+      PrintWithColorRAII(OS, LiteralValueColor) << " negative";
     PrintWithColorRAII(OS, LiteralValueColor)
       << " value=" << E->getDigitsText();
+    PrintWithColorRAII(OS, LiteralValueColor) << " builtin_initializer=";
+    E->getBuiltinInitializer().dump(
+        PrintWithColorRAII(OS, LiteralValueColor).getOS());
+    PrintWithColorRAII(OS, LiteralValueColor) << " initializer=";
+    E->getInitializer().dump(PrintWithColorRAII(OS, LiteralValueColor).getOS());
+    if (!E->getBuiltinType().isNull()) {
+      PrintWithColorRAII(OS, TypeColor) << " builtin_type='";
+      E->getBuiltinType().print(PrintWithColorRAII(OS, TypeColor).getOS());
+      PrintWithColorRAII(OS, TypeColor) << "'";
+    }
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
   void visitBooleanLiteralExpr(BooleanLiteralExpr *E) {
     printCommon(E, "boolean_literal_expr");
     PrintWithColorRAII(OS, LiteralValueColor)
-      << " value=" << (E->getValue() ? "true" : "false");
+      << " value=" << (E->getValue() ? "true" : "false")
+      << " builtin_initializer=";
+    E->getBuiltinInitializer().dump(
+      PrintWithColorRAII(OS, LiteralValueColor).getOS());
+    PrintWithColorRAII(OS, LiteralValueColor) << " initializer=";
+    E->getInitializer().dump(PrintWithColorRAII(OS, LiteralValueColor).getOS());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -1856,12 +1904,12 @@ public:
 
     if (E->isString()) {
       OS << " encoding="
-         << getStringLiteralExprEncodingString(E->getStringEncoding())
-         << " builtin_initializer=";
-      E->getBuiltinInitializer().dump(OS);
-      OS << " initializer=";
-      E->getInitializer().dump(OS);
+         << getStringLiteralExprEncodingString(E->getStringEncoding());
     }
+    OS << " builtin_initializer=";
+    E->getBuiltinInitializer().dump(OS);
+    OS << " initializer=";
+    E->getInitializer().dump(OS);
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
@@ -2020,6 +2068,8 @@ public:
   }
   void visitArrayExpr(ArrayExpr *E) {
     printCommon(E, "array_expr");
+    PrintWithColorRAII(OS, LiteralValueColor) << " initializer=";
+    E->getInitializer().dump(PrintWithColorRAII(OS, LiteralValueColor).getOS());
     for (auto elt : E->getElements()) {
       OS << '\n';
       printRec(elt);
@@ -2090,40 +2140,20 @@ public:
     printRec(E->getBase());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
-  void visitTupleShuffleExpr(TupleShuffleExpr *E) {
-    printCommon(E, "tuple_shuffle_expr");
-    switch (E->getTypeImpact()) {
-    case TupleShuffleExpr::ScalarToTuple:
-      OS << " scalar_to_tuple";
-      break;
-    case TupleShuffleExpr::TupleToTuple:
-      OS << " tuple_to_tuple";
-      break;
-    case TupleShuffleExpr::TupleToScalar:
-      OS << " tuple_to_scalar";
-      break;
+  void visitDestructureTupleExpr(DestructureTupleExpr *E) {
+    printCommon(E, "destructure_tuple_expr");
+    OS << " destructured=";
+    PrintWithColorRAII(OS, ParenthesisColor) << '(';
+    Indent += 2;
+    for (auto *elt : E->getDestructuredElements()) {
+      OS << "\n";
+      printRec(elt);
     }
-    OS << " elements=[";
-    for (unsigned i = 0, e = E->getElementMapping().size(); i != e; ++i) {
-      if (i) OS << ", ";
-      OS << E->getElementMapping()[i];
-    }
-    OS << "]";
-    OS << " variadic_sources=[";
-    interleave(E->getVariadicArgs(),
-               [&](unsigned source) {
-                 OS << source;
-               },
-               [&] { OS << ", "; });
-    OS << "]";
-
-    if (auto defaultArgsOwner = E->getDefaultArgsOwner()) {
-      OS << " default_args_owner=";
-      defaultArgsOwner.dump(OS);
-    }
-
-    OS << "\n";
+    Indent -= 2;
+    PrintWithColorRAII(OS, ParenthesisColor) << ")\n";
     printRec(E->getSubExpr());
+    OS << "\n";
+    printRec(E->getResultExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
   void visitUnresolvedTypeConversionExpr(UnresolvedTypeConversionExpr *E) {
@@ -2388,6 +2418,20 @@ public:
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
+  void visitDefaultArgumentExpr(DefaultArgumentExpr *E) {
+    printCommon(E, "default_argument_expr");
+    OS << " default_args_owner=";
+    E->getDefaultArgsOwner().dump(OS);
+    OS << " param=" << E->getParamIndex();
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
+  void visitCallerDefaultArgumentExpr(CallerDefaultArgumentExpr *E) {
+    printCommon(E, "caller_default_argument_expr");
+    printRec(E->getSubExpr());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
   void printArgumentLabels(ArrayRef<Identifier> argLabels) {
     PrintWithColorRAII(OS, ArgumentsColor) << " arg_labels=";
     for (auto label : argLabels) {
@@ -2617,6 +2661,11 @@ public:
       case KeyPathExpr::Component::Kind::Identity:
         OS << "identity";
         OS << '\n';
+        break;
+      case KeyPathExpr::Component::Kind::TupleElement:
+        OS << "tuple_element ";
+        OS << "#" << component.getTupleIndex();
+        OS << " ";
         break;
       }
       OS << "type=";
@@ -3226,8 +3275,8 @@ namespace {
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 
-    void visitNameAliasType(NameAliasType *T, StringRef label) {
-      printCommon(label, "name_alias_type");
+    void visitTypeAliasType(TypeAliasType *T, StringRef label) {
+      printCommon(label, "type_alias_type");
       printField("decl", T->getDecl()->printRef());
       if (T->getParent())
         printRec("parent", T->getParent());

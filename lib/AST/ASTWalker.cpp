@@ -37,7 +37,7 @@
 //      Note that semantic components will generally preserve the
 //      syntactic order of their children because doing something else
 //      could illegally change order of evaluation.  This is why, for
-//      example, shuffling a TupleExpr creates a TupleShuffleExpr
+//      example, shuffling a TupleExpr creates a DestructureTupleExpr
 //      instead of just making a new TupleExpr with the elements in
 //      different order.
 //
@@ -443,6 +443,17 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
   Expr *visitOpaqueValueExpr(OpaqueValueExpr *E) { return E; }
 
+  Expr *visitDefaultArgumentExpr(DefaultArgumentExpr *E) { return E; }
+
+  Expr *visitCallerDefaultArgumentExpr(CallerDefaultArgumentExpr *E) {
+    if (auto subExpr = doIt(E->getSubExpr())) {
+      E->setSubExpr(subExpr);
+      return E;
+    }
+
+    return nullptr;
+  }
+
   Expr *visitInterpolatedStringLiteralExpr(InterpolatedStringLiteralExpr *E) {
     HANDLE_SEMANTIC_EXPR(E);
 
@@ -639,18 +650,17 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return E;
   }
   
-  Expr *visitTupleShuffleExpr(TupleShuffleExpr *E) {
-    if (Expr *E2 = doIt(E->getSubExpr())) {
-      E->setSubExpr(E2);
+  Expr *visitDestructureTupleExpr(DestructureTupleExpr *E) {
+    if (auto *src = doIt(E->getSubExpr())) {
+      E->setSubExpr(src);
     } else {
       return nullptr;
     }
 
-    for (auto &defaultArg : E->getCallerDefaultArgs()) {
-      if (Expr *newDefaultArg = doIt(defaultArg))
-        defaultArg = newDefaultArg;
-      else
-        return nullptr;
+    if (auto *dst = doIt(E->getResultExpr())) {
+      E->setResultExpr(dst);
+    } else {
+      return nullptr;
     }
 
     return E;
@@ -1034,6 +1044,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       case KeyPathExpr::Component::Kind::UnresolvedProperty:
       case KeyPathExpr::Component::Kind::Invalid:
       case KeyPathExpr::Component::Kind::Identity:
+      case KeyPathExpr::Component::Kind::TupleElement:
         // No subexpr to visit.
         break;
       }

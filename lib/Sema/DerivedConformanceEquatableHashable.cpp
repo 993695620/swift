@@ -78,7 +78,8 @@ static bool allStoredPropertiesConformToProtocol(DeclContext *DC,
     if (!propertyDecl->hasType())
       return false;
 
-    auto type = propertyDecl->getType()->mapTypeOutOfContext();
+    auto type = propertyDecl->getValueInterfaceType();
+
     if (!TypeChecker::conformsToProtocol(DC->mapTypeIntoContext(type),
                                          protocol, DC,
                                          ConformanceCheckFlags::Used)) {
@@ -245,9 +246,9 @@ static DeclRefExpr *convertEnumToIndex(SmallVectorImpl<ASTNode> &stmts,
                                          indexExpr, /*implicit*/ true);
     auto body = BraceStmt::create(C, SourceLoc(), ASTNode(assignExpr),
                                   SourceLoc());
-    cases.push_back(CaseStmt::create(C, SourceLoc(), labelItem,
-                                     /*HasBoundDecls=*/false, SourceLoc(),
-                                     SourceLoc(), body));
+    cases.push_back(CaseStmt::create(C, SourceLoc(), labelItem, SourceLoc(),
+                                     SourceLoc(), body,
+                                     /*case body vardecls*/ None));
   }
 
   // generate: switch enumVar { }
@@ -433,6 +434,22 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
     rhsElemPat->setImplicit();
 
     auto hasBoundDecls = !lhsPayloadVars.empty();
+    Optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
+    if (hasBoundDecls) {
+      // We allocated a direct copy of our lhs var decls for the case
+      // body.
+      auto copy = C.Allocate<VarDecl *>(lhsPayloadVars.size());
+      for (unsigned i : indices(lhsPayloadVars)) {
+        auto *vOld = lhsPayloadVars[i];
+        auto *vNew = new (C) VarDecl(
+            /*IsStatic*/ false, vOld->getSpecifier(), false /*IsCaptureList*/,
+            vOld->getNameLoc(), vOld->getName(), vOld->getDeclContext());
+        vNew->setHasNonPatternBindingInit();
+        vNew->setImplicit();
+        copy[i] = vNew;
+      }
+      caseBodyVarDecls.emplace(copy);
+    }
 
     // case (.<elt>(let l0, let l1, ...), .<elt>(let r0, let r1, ...))
     auto caseTuplePattern = TuplePattern::create(C, SourceLoc(), {
@@ -468,8 +485,8 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
 
     auto body = BraceStmt::create(C, SourceLoc(), statementsInCase,
                                   SourceLoc());
-    cases.push_back(CaseStmt::create(C, SourceLoc(), labelItem, hasBoundDecls,
-                                     SourceLoc(), SourceLoc(), body));
+    cases.push_back(CaseStmt::create(C, SourceLoc(), labelItem, SourceLoc(),
+                                     SourceLoc(), body, caseBodyVarDecls));
   }
 
   // default: result = false
@@ -485,9 +502,9 @@ deriveBodyEquatable_enum_hasAssociatedValues_eq(AbstractFunctionDecl *eqDecl,
     auto returnStmt = new (C) ReturnStmt(SourceLoc(), falseExpr);
     auto body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                   SourceLoc());
-    cases.push_back(CaseStmt::create(C, SourceLoc(), defaultItem,
-                                     /*HasBoundDecls*/ false,
-                                     SourceLoc(), SourceLoc(), body));
+    cases.push_back(CaseStmt::create(C, SourceLoc(), defaultItem, SourceLoc(),
+                                     SourceLoc(), body,
+                                     /*case body var decls*/ None));
   }
 
   // switch (a, b) { <case statements> }
@@ -614,8 +631,7 @@ deriveEquatable_eq(DerivedConformance &derived,
   auto boolTy = C.getBoolDecl()->getDeclaredType();
 
   Identifier generatedIdentifier;
-  if (parentDC->getParentModule()->getResilienceStrategy() ==
-      ResilienceStrategy::Resilient) {
+  if (parentDC->getParentModule()->isResilient()) {
     generatedIdentifier = C.Id_EqualsOperator;
   } else if (selfIfaceTy->getEnumOrBoundGenericEnum()) {
     generatedIdentifier = C.Id_derived_enum_equals;
@@ -959,9 +975,24 @@ deriveBodyHashable_enum_hasAssociatedValues_hashInto(
     }
 
     auto hasBoundDecls = !payloadVars.empty();
+    Optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
+    if (hasBoundDecls) {
+      auto copy = C.Allocate<VarDecl *>(payloadVars.size());
+      for (unsigned i : indices(payloadVars)) {
+        auto *vOld = payloadVars[i];
+        auto *vNew = new (C) VarDecl(
+            /*IsStatic*/ false, vOld->getSpecifier(), false /*IsCaptureList*/,
+            vOld->getNameLoc(), vOld->getName(), vOld->getDeclContext());
+        vNew->setHasNonPatternBindingInit();
+        vNew->setImplicit();
+        copy[i] = vNew;
+      }
+      caseBodyVarDecls.emplace(copy);
+    }
+
     auto body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
-    cases.push_back(CaseStmt::create(C, SourceLoc(), labelItem, hasBoundDecls,
-                                     SourceLoc(), SourceLoc(), body,
+    cases.push_back(CaseStmt::create(C, SourceLoc(), labelItem, SourceLoc(),
+                                     SourceLoc(), body, caseBodyVarDecls,
                                      /*implicit*/ true));
   }
 
@@ -1185,9 +1216,9 @@ ValueDecl *DerivedConformance::deriveHashable(ValueDecl *requirement) {
       auto hashableProto = C.getProtocol(KnownProtocolKind::Hashable);
       if (!canDeriveConformance(getConformanceContext(), Nominal,
                                 hashableProto)) {
-        TC.diagnose(ConformanceDecl->getLoc(), diag::type_does_not_conform,
-                    Nominal->getDeclaredType(),
-                    hashableProto->getDeclaredType());
+        ConformanceDecl->diagnose(diag::type_does_not_conform,
+                                  Nominal->getDeclaredType(),
+                                  hashableProto->getDeclaredType());
         return nullptr;
       }
 
@@ -1213,13 +1244,13 @@ ValueDecl *DerivedConformance::deriveHashable(ValueDecl *requirement) {
       // hashValue has an explicit implementation, but hash(into:) doesn't.
       // Emit a deprecation warning, then derive hash(into:) in terms of
       // hashValue.
-      TC.diagnose(hashValueDecl->getLoc(), diag::hashvalue_implementation,
-                  Nominal->getDeclaredType());
+      hashValueDecl->diagnose(diag::hashvalue_implementation,
+                              Nominal->getDeclaredType());
       return deriveHashable_hashInto(*this,
                                      &deriveBodyHashable_compat_hashInto);
     }
   }
 
-  TC.diagnose(requirement->getLoc(), diag::broken_hashable_requirement);
+  requirement->diagnose(diag::broken_hashable_requirement);
   return nullptr;
 }

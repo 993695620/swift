@@ -495,27 +495,26 @@ public:
   SILOptions &getOptions() { return getModule().getOptions(); }
 
   const TypeLowering &getTypeLowering(AbstractionPattern orig, Type subst) {
-    return SGM.Types.getTypeLowering(orig, subst);
+    return F.getTypeLowering(orig, subst);
   }
   const TypeLowering &getTypeLowering(Type t) {
-    return SGM.Types.getTypeLowering(t);
+    return F.getTypeLowering(t);
   }
   CanSILFunctionType getSILFunctionType(AbstractionPattern orig,
                                         CanFunctionType substFnType) {
     return SGM.Types.getSILFunctionType(orig, substFnType);
   }
   SILType getLoweredType(AbstractionPattern orig, Type subst) {
-    return SGM.Types.getLoweredType(orig, subst);
+    return F.getLoweredType(orig, subst);
   }
   SILType getLoweredType(Type t) {
-    return SGM.Types.getLoweredType(t);
+    return F.getLoweredType(t);
   }
   SILType getLoweredLoadableType(Type t) {
-    return SGM.Types.getLoweredLoadableType(t);
+    return F.getLoweredLoadableType(t);
   }
-
   const TypeLowering &getTypeLowering(SILType type) {
-    return SGM.Types.getTypeLowering(type);
+    return F.getTypeLowering(type);
   }
 
   SILType getSILType(SILParameterInfo param) const {
@@ -667,12 +666,6 @@ public:
                                CanAnyFunctionType funcTy,
                                CanAnyFunctionType blockTy,
                                CanSILFunctionType loweredBlockTy);
-
-  /// Given a non-canonical function type, create a thunk for the function's
-  /// canonical type.
-  ManagedValue emitCanonicalFunctionThunk(SILLocation loc, ManagedValue fn,
-                                          CanSILFunctionType nonCanonicalTy,
-                                          CanSILFunctionType canonicalTy);
 
   /// Thunk with the signature of a base class method calling a derived class
   /// method.
@@ -855,7 +848,7 @@ public:
   //===--------------------------------------------------------------------===//
 
   ManagedValue emitInjectEnum(SILLocation loc,
-                              ArgumentSource payload,
+                              ArgumentSource &&payload,
                               SILType enumTy,
                               EnumElementDecl *element,
                               SGFContext C);
@@ -978,28 +971,19 @@ public:
                                             CanType inputTy,
                                             SILType resultTy);
 
-  struct OpaqueValueState {
-    ManagedValue Value;
-    bool IsConsumable;
-    bool HasBeenConsumed;
-  };
-
-  ManagedValue manageOpaqueValue(OpaqueValueState &entry,
+  ManagedValue manageOpaqueValue(ManagedValue value,
                                  SILLocation loc,
                                  SGFContext C);
 
   /// Open up the given existential value and project its payload.
   ///
   /// \param existentialValue The existential value.
-  /// \param openedArchetype The opened existential archetype.
   /// \param loweredOpenedType The lowered type of the projection, which in
   /// practice will be the openedArchetype, possibly wrapped in a metatype.
-  OpaqueValueState
-  emitOpenExistential(SILLocation loc,
-                      ManagedValue existentialValue,
-                      ArchetypeType *openedArchetype,
-                      SILType loweredOpenedType,
-                      AccessKind accessKind);
+  ManagedValue emitOpenExistential(SILLocation loc,
+                                   ManagedValue existentialValue,
+                                   SILType loweredOpenedType,
+                                   AccessKind accessKind);
 
   /// Wrap the given value in an existential container.
   ///
@@ -1127,8 +1111,8 @@ public:
   ManagedValue emitRValueAsSingleValue(Expr *E, SGFContext C = SGFContext());
 
   /// Emit 'undef' in a particular formal type.
-  ManagedValue emitUndef(SILLocation loc, Type type);
-  ManagedValue emitUndef(SILLocation loc, SILType type);
+  ManagedValue emitUndef(Type type);
+  ManagedValue emitUndef(SILType type);
   RValue emitUndefRValue(SILLocation loc, Type type);
   
   std::pair<ManagedValue, SILValue>
@@ -1429,7 +1413,7 @@ public:
   // Helpers for emitting ApplyExpr chains.
   //
 
-  RValue emitApplyExpr(Expr *e, SGFContext c);
+  RValue emitApplyExpr(ApplyExpr *e, SGFContext c);
 
   /// Emit a function application, assuming that the arguments have been
   /// lowered appropriately for the abstraction level but that the
@@ -1475,7 +1459,7 @@ public:
                                      SGFContext ctx);
 
   RValue emitApplyAllocatingInitializer(SILLocation loc, ConcreteDeclRef init,
-                                        RValue &&args, Type overriddenSelfType,
+                                        PreparedArguments &&args, Type overriddenSelfType,
                                         SGFContext ctx);
 
   CleanupHandle emitBeginApply(SILLocation loc, ManagedValue fn,
@@ -1547,9 +1531,8 @@ public:
     emitOpenExistentialExprImpl(e, emitSubExpr);
   }
 
-  /// Mapping from active opaque value expressions to their values,
-  /// along with a bit for each indicating whether it has been consumed yet.
-  llvm::SmallDenseMap<OpaqueValueExpr *, OpaqueValueState>
+  /// Mapping from active opaque value expressions to their values.
+  llvm::SmallDenseMap<OpaqueValueExpr *, ManagedValue>
     OpaqueValues;
 
   /// A mapping from opaque value expressions to the open-existential
@@ -1571,11 +1554,11 @@ public:
 
   public:
     OpaqueValueRAII(SILGenFunction &self, OpaqueValueExpr *opaqueValue,
-                    OpaqueValueState state)
+                    ManagedValue value)
     : Self(self), OpaqueValue(opaqueValue) {
       assert(Self.OpaqueValues.count(OpaqueValue) == 0 &&
              "Opaque value already has a binding");
-      Self.OpaqueValues[OpaqueValue] = state;
+      Self.OpaqueValues[OpaqueValue] = value;
     }
 
     ~OpaqueValueRAII();
@@ -1761,6 +1744,7 @@ public:
                                     CanType &outputSubstType,
                                     GenericEnvironment *&genericEnv,
                                     SubstitutionMap &interfaceSubs,
+                                    CanType &dynamicSelfType,
                                     bool withoutActuallyEscaping=false);
 
   //===--------------------------------------------------------------------===//

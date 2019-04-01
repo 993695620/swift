@@ -87,6 +87,12 @@ public typealias CLongDouble = Float80
 // Long Double type equivalent to Double type.
 public typealias CLongDouble = Double
 #endif
+#elseif os(Android)
+// On Android, long double is Float128 for AAPCS64, which we don't have yet in
+// Swift (SR-9072); and Double for ARMv7.
+#if arch(arm)
+public typealias CLongDouble = Double
+#endif
 #endif
 
 // FIXME: Is it actually UTF-32 on Darwin?
@@ -219,15 +225,15 @@ extension UInt {
 }
 
 /// A wrapper around a C `va_list` pointer.
-#if arch(arm64) && os(Linux)
+#if arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Windows))
 @_fixed_layout
 public struct CVaListPointer {
   @usableFromInline // unsafe-performance
-  internal var value: (__stack: UnsafeMutablePointer<Int>?,
-                       __gr_top: UnsafeMutablePointer<Int>?,
-                       __vr_top: UnsafeMutablePointer<Int>?,
-                       __gr_off: Int32,
-                       __vr_off: Int32)
+  internal var _value: (__stack: UnsafeMutablePointer<Int>?,
+                        __gr_top: UnsafeMutablePointer<Int>?,
+                        __vr_top: UnsafeMutablePointer<Int>?,
+                        __gr_off: Int32,
+                        __vr_off: Int32)
 
   @inlinable // unsafe-performance
   public // @testable
@@ -236,7 +242,17 @@ public struct CVaListPointer {
        __vr_top: UnsafeMutablePointer<Int>?,
        __gr_off: Int32,
        __vr_off: Int32) {
-    value = (__stack, __gr_top, __vr_top, __gr_off, __vr_off)
+    _value = (__stack, __gr_top, __vr_top, __gr_off, __vr_off)
+  }
+}
+
+extension CVaListPointer : CustomDebugStringConvertible {
+  public var debugDescription: String {
+    return "(\(_value.__stack.debugDescription), " +
+           "\(_value.__gr_top.debugDescription), " +
+           "\(_value.__vr_top.debugDescription), " +
+           "\(_value.__gr_off), " +
+           "\(_value.__vr_off))"
   }
 }
 

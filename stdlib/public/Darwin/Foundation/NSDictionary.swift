@@ -136,7 +136,7 @@ extension Dictionary : _ObjectiveCBridgeable {
     to: T.Type
   ) {
     for i in (0..<count).reversed() {
-      let bridged = Swift._forceBridgeFromObjectiveC(buffer[i], T.self)
+      let bridged = buffer[i] as! T
       _bridgeInitialize(index: i, of: buffer, to: bridged)
     }
   }
@@ -222,11 +222,9 @@ extension Dictionary : _ObjectiveCBridgeable {
     if keyStride < objectStride || valueStride < objectStride {
       var builder = _DictionaryBuilder<Key, Value>(count: d.count)
       d.enumerateKeysAndObjects({ (anyKey: Any, anyValue: Any, _) in
-        let anyObjectKey = anyKey as AnyObject
-        let anyObjectValue = anyValue as AnyObject
         builder.add(
-            key: Swift._forceBridgeFromObjectiveC(anyObjectKey, Key.self),
-            value: Swift._forceBridgeFromObjectiveC(anyObjectValue, Value.self))
+          key: anyKey as! Key,
+          value: anyValue as! Value)
       })
       result = builder.take()
     } else {
@@ -348,6 +346,11 @@ extension NSDictionary : _HasCustomAnyHashableRepresentation {
 extension NSDictionary : Sequence {
   // FIXME: A class because we can't pass a struct with class fields through an
   // [objc] interface without prematurely destroying the references.
+  // NOTE: older runtimes had
+  // _TtCE10FoundationCSo12NSDictionary8Iterator as the ObjC name. The
+  // two must coexist, so it was renamed. The old name must not be used
+  // in the new runtime.
+  @_objcRuntimeName(_TtCE10FoundationCSo12NSDictionary9_Iterator)
   final public class Iterator : IteratorProtocol {
     var _fastIterator: NSFastEnumerationIterator
     var _dictionary: NSDictionary {

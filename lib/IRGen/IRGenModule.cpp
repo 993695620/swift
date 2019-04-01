@@ -14,6 +14,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/Availability.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/DiagnosticsIRGen.h"
@@ -34,7 +35,7 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/HeaderSearchOptions.h"
-#include "clang/Frontend/CodeGenOptions.h"
+#include "clang/Basic/CodeGenOptions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -429,7 +430,24 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
                     // point too.
   };
   ObjCBlockStructTy->setBody(objcBlockElts);
-  
+
+  // Class _Nullable callback(Class _Nonnull cls, void * _Nullable arg);
+  llvm::Type *params[] = { ObjCClassPtrTy, Int8PtrTy };
+  ObjCUpdateCallbackTy = llvm::FunctionType::get(ObjCClassPtrTy, params, false);
+
+  // The full class stub structure, including a word before the address point.
+  ObjCFullResilientClassStubTy = createStructType(*this, "objc_full_class_stub", {
+    SizeTy, // zero padding to appease the linker
+    SizeTy, // isa pointer -- always 1
+    ObjCUpdateCallbackTy->getPointerTo() // the update callback
+  });
+
+  // What we actually export.
+  ObjCResilientClassStubTy = createStructType(*this, "objc_class_stub", {
+    SizeTy, // isa pointer -- always 1
+    ObjCUpdateCallbackTy->getPointerTo() // the update callback
+  });
+
   auto ErrorStructTy = llvm::StructType::create(LLVMContext, "swift.error");
   // ErrorStruct is currently opaque to the compiler.
   ErrorPtrTy = ErrorStructTy->getPointerTo(DefaultAS);
@@ -659,8 +677,8 @@ IRGenModule::createStringConstant(StringRef Str,
       return NAME;                                                             \
     NAME = Module.getOrInsertGlobal(SYM, FullTypeMetadataStructTy);            \
     if (useDllStorage() && !isStandardLibrary())                               \
-      cast<llvm::GlobalVariable>(NAME)->setDLLStorageClass(                    \
-          llvm::GlobalValue::DLLImportStorageClass);                           \
+      ApplyIRLinkage(IRLinkage::ExternalImport)                                \
+          .to(cast<llvm::GlobalVariable>(NAME));                               \
     return NAME;                                                               \
   }
 
@@ -681,9 +699,8 @@ llvm::Constant *IRGenModule::getObjCEmptyCachePtr() {
     // struct objc_cache _objc_empty_cache;
     ObjCEmptyCachePtr = Module.getOrInsertGlobal("_objc_empty_cache",
                                                  OpaquePtrTy->getElementType());
-    if (useDllStorage())
-      cast<llvm::GlobalVariable>(ObjCEmptyCachePtr)
-          ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalImport)
+        .to(cast<llvm::GlobalVariable>(ObjCEmptyCachePtr));
   } else {
     // FIXME: Remove even the null value per rdar://problem/18801263
     ObjCEmptyCachePtr = llvm::ConstantPointerNull::get(OpaquePtrTy);
@@ -714,15 +731,18 @@ Address IRGenModule::getAddrOfObjCISAMask() {
   assert(TargetInfo.hasISAMasking());
   if (!ObjCISAMaskPtr) {
     ObjCISAMaskPtr = Module.getOrInsertGlobal("swift_isaMask", IntPtrTy);
-    if (useDllStorage())
-      cast<llvm::GlobalVariable>(ObjCISAMaskPtr)
-          ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalImport)
+        .to(cast<llvm::GlobalVariable>(ObjCISAMaskPtr));
   }
   return Address(ObjCISAMaskPtr, getPointerAlignment());
 }
 
 ModuleDecl *IRGenModule::getSwiftModule() const {
   return IRGen.SIL.getSwiftModule();
+}
+
+AvailabilityContext IRGenModule::getAvailabilityContext() const {
+  return AvailabilityContext::forDeploymentTarget(Context);
 }
 
 Lowering::TypeConverter &IRGenModule::getSILTypes() const {
@@ -960,9 +980,8 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
     encodeForceLoadSymbolName(buf, linkLib.getName());
     auto ForceImportThunk =
         Module.getOrInsertFunction(buf, llvm::FunctionType::get(VoidTy, false));
-    if (useDllStorage())
-      cast<llvm::GlobalValue>(ForceImportThunk)
-          ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalImport)
+        .to(cast<llvm::GlobalValue>(ForceImportThunk));
 
     buf += "_$";
     appendEncodedName(buf, IRGen.Opts.ModuleName);
@@ -970,9 +989,9 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
     if (!Module.getGlobalVariable(buf.str())) {
       auto ref = new llvm::GlobalVariable(Module, ForceImportThunk->getType(),
                                           /*isConstant=*/true,
-                                          llvm::GlobalValue::WeakAnyLinkage,
+                                          llvm::GlobalValue::WeakODRLinkage,
                                           ForceImportThunk, buf.str());
-      ref->setVisibility(llvm::GlobalValue::HiddenVisibility);
+      ApplyIRLinkage(IRLinkage::InternalWeakODR).to(ref);
       auto casted = llvm::ConstantExpr::getBitCast(ref, Int8PtrTy);
       LLVMUsed.push_back(casted);
     }
@@ -1049,6 +1068,7 @@ void IRGenModule::emitAutolinkInfo() {
 
   } else {
     assert((TargetInfo.OutputObjectFormat == llvm::Triple::ELF ||
+            TargetInfo.OutputObjectFormat == llvm::Triple::Wasm ||
             Triple.isOSCygMing()) &&
            "expected ELF output format or COFF format for Cygwin/MinGW");
 
@@ -1083,9 +1103,7 @@ void IRGenModule::emitAutolinkInfo() {
         llvm::Function::Create(llvm::FunctionType::get(VoidTy, false),
                                llvm::GlobalValue::ExternalLinkage, buf,
                                &Module);
-    if (useDllStorage())
-      ForceImportThunk
-          ->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalExport).to(ForceImportThunk);
 
     auto BB = llvm::BasicBlock::Create(getLLVMContext(), "", ForceImportThunk);
     llvm::IRBuilder<> IRB(BB);

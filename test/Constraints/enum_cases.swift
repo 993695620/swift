@@ -107,3 +107,51 @@ struct Foo_32551313 {
     return E_32551313.Left("", Foo_32551313()) // expected-error {{extra argument in call}}
   }
 }
+
+func rdar34583132() {
+  enum E {
+    case timeOut
+  }
+
+  struct S {
+    func foo(_ x: Int) -> E { return .timeOut }
+  }
+
+  func bar(_ s: S) {
+    guard s.foo(1 + 2) == .timeout else {
+    // expected-error@-1 {{enum type 'E' has no case 'timeout'; did you mean 'timeOut'}}
+      fatalError()
+    }
+  }
+}
+
+func rdar_49159472() {
+  struct A {}
+  struct B {}
+  struct C {}
+
+  enum E {
+  case foo(a: A, b: B?)
+
+    var foo: C? {
+      return nil
+    }
+  }
+
+  class Test {
+    var e: E
+
+    init(_ e: E) {
+      self.e = e
+    }
+
+    func bar() {
+      e = .foo(a: A(), b: nil)   // Ok
+      e = E.foo(a: A(), b: nil)  // Ok
+      baz(e: .foo(a: A(), b: nil))  // Ok
+      baz(e: E.foo(a: A(), b: nil)) // Ok
+    }
+
+    func baz(e: E) {}
+  }
+}

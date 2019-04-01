@@ -58,12 +58,21 @@ TypeChecker::getFragileFunctionKind(const DeclContext *DC) {
         return std::make_pair(FragileFunctionKind::Inlinable,
                               /*treatUsableFromInlineAsPublic=*/true);
 
+      if (AFD->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
+        return std::make_pair(FragileFunctionKind::AlwaysEmitIntoClient,
+                              /*treatUsableFromInlineAsPublic=*/true);
+
       // If a property or subscript is @inlinable, the accessors are
       // @inlinable also.
-      if (auto accessor = dyn_cast<AccessorDecl>(AFD))
-        if (accessor->getStorage()->getAttrs().getAttribute<InlinableAttr>())
+      if (auto accessor = dyn_cast<AccessorDecl>(AFD)) {
+        auto *storage = accessor->getStorage();
+        if (storage->getAttrs().getAttribute<InlinableAttr>())
           return std::make_pair(FragileFunctionKind::Inlinable,
                                 /*treatUsableFromInlineAsPublic=*/true);
+        if (storage->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
+          return std::make_pair(FragileFunctionKind::AlwaysEmitIntoClient,
+                                /*treatUsableFromInlineAsPublic=*/true);
+      }
     }
   }
 
@@ -110,8 +119,7 @@ bool TypeChecker::diagnoseInlinableDeclRef(SourceLoc loc,
   // Do enforce the restriction even in pre-Swift-5 modes if the module we're
   // building is resilient, though.
   if (D->isObjCDynamic() && !Context.isSwiftVersionAtLeast(5) &&
-      DC->getParentModule()->getResilienceStrategy() !=
-        ResilienceStrategy::Resilient) {
+      !DC->getParentModule()->isResilient()) {
     return false;
   }
 

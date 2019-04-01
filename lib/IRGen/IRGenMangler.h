@@ -107,6 +107,14 @@ public:
     return mangleNominalTypeSymbol(Decl, "MU");
   }
 
+  std::string mangleObjCResilientClassStub(const ClassDecl *Decl) {
+    return mangleNominalTypeSymbol(Decl, "Ms");
+  }
+
+  std::string mangleFullObjCResilientClassStub(const ClassDecl *Decl) {
+    return mangleNominalTypeSymbol(Decl, "Mt");
+  }
+
   std::string mangleClassMetadataBaseOffset(const ClassDecl *Decl) {
     return mangleNominalTypeSymbol(Decl, "Mo");
   }
@@ -153,11 +161,16 @@ public:
     appendOperator("MXX");
     return finalize();
   }
-  
+
+  std::string mangleContext(const DeclContext *DC) {
+    beginMangling();
+    appendContext(DC);
+    return finalize();
+  }
+
   std::string mangleBareProtocol(const ProtocolDecl *Decl) {
     beginMangling();
-    appendProtocolName(Decl, /*allowStandardSubstitution=*/false);
-    appendOperator("P");
+    appendAnyGenericType(Decl);
     return finalize();
   }
 

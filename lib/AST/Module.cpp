@@ -32,6 +32,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
@@ -565,6 +566,19 @@ void SourceFile::getLocalTypeDecls(SmallVectorImpl<TypeDecl*> &Results) const {
   Results.append(LocalTypeDecls.begin(), LocalTypeDecls.end());
 }
 
+TypeDecl *SourceFile::lookupLocalType(llvm::StringRef mangledName) const {
+  ASTContext &ctx = getASTContext();
+  for (auto typeDecl : LocalTypeDecls) {
+    auto typeMangledName = evaluateOrDefault(ctx.evaluator,
+                                             MangleLocalTypeDeclRequest { typeDecl },
+                                             std::string());
+    if (mangledName == typeMangledName)
+      return typeDecl;
+  }
+
+  return nullptr;
+}
+
 void ModuleDecl::getDisplayDecls(SmallVectorImpl<Decl*> &Results) const {
   // FIXME: Should this do extra access control filtering?
   FORWARD(getDisplayDecls, (Results));
@@ -1006,21 +1020,18 @@ void
 SourceFile::getImportedModules(SmallVectorImpl<ModuleDecl::ImportedModule> &modules,
                                ModuleDecl::ImportFilter filter) const {
   assert(ASTStage >= Parsed || Kind == SourceFileKind::SIL);
+  assert(filter && "no imports requested?");
   for (auto desc : Imports) {
-    switch (filter) {
-    case ModuleDecl::ImportFilter::All:
-      break;
-    case ModuleDecl::ImportFilter::Public:
-      if (!desc.importOptions.contains(ImportFlags::Exported))
-        continue;
-      break;
-    case ModuleDecl::ImportFilter::Private:
-      if (desc.importOptions.contains(ImportFlags::Exported))
-        continue;
-      break;
-    }
+    ModuleDecl::ImportFilterKind requiredKind;
+    if (desc.importOptions.contains(ImportFlags::Exported))
+      requiredKind = ModuleDecl::ImportFilterKind::Public;
+    else if (desc.importOptions.contains(ImportFlags::ImplementationOnly))
+      requiredKind = ModuleDecl::ImportFilterKind::ImplementationOnly;
+    else
+      requiredKind = ModuleDecl::ImportFilterKind::Private;
 
-    modules.push_back(desc.module);
+    if (filter.contains(requiredKind))
+      modules.push_back(desc.module);
   }
 }
 
@@ -1263,9 +1274,14 @@ forAllImportedModules(ModuleDecl *topLevel, ModuleDecl::AccessPathTy thisPath,
   llvm::SmallSet<ImportedModule, 32, ModuleDecl::OrderImportedModules> visited;
   SmallVector<ImportedModule, 32> stack;
 
-  auto filter = respectVisibility ? ModuleDecl::ImportFilter::Public
-                                  : ModuleDecl::ImportFilter::All;
-  topLevel->getImportedModules(stack, filter);
+  ModuleDecl::ImportFilter filter = ModuleDecl::ImportFilterKind::Public;
+  if (!respectVisibility)
+    filter |= ModuleDecl::ImportFilterKind::Private;
+
+  ModuleDecl::ImportFilter topLevelFilter = filter;
+  if (!respectVisibility)
+    topLevelFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
+  topLevel->getImportedModules(stack, topLevelFilter);
 
   // Make sure the top-level module is first; we want pre-order-ish traversal.
   AccessPathTy overridingPath;
@@ -1316,9 +1332,11 @@ bool FileUnit::forAllVisibleModules(
 
   if (auto SF = dyn_cast<SourceFile>(this)) {
     // Handle privately visible modules as well.
-    // FIXME: Should this apply to all FileUnits?
+    ModuleDecl::ImportFilter importFilter;
+    importFilter |= ModuleDecl::ImportFilterKind::Private;
+    importFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
     SmallVector<ModuleDecl::ImportedModule, 4> imports;
-    SF->getImportedModules(imports, ModuleDecl::ImportFilter::Private);
+    SF->getImportedModules(imports, importFilter);
     for (auto importPair : imports)
       if (!importPair.second->forAllVisibleModules(importPair.first, fn))
         return false;

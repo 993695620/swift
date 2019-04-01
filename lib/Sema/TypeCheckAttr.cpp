@@ -20,8 +20,10 @@
 #include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
@@ -72,6 +74,7 @@ public:
   bool visitDeclAttribute(DeclAttribute *A) = delete;
 
 #define IGNORED_ATTR(X) void visit##X##Attr(X##Attr *) {}
+  IGNORED_ATTR(AlwaysEmitIntoClient)
   IGNORED_ATTR(Available)
   IGNORED_ATTR(HasInitialValue)
   IGNORED_ATTR(CDecl)
@@ -86,6 +89,7 @@ public:
   IGNORED_ATTR(ForbidSerializingReference)
   IGNORED_ATTR(Frozen)
   IGNORED_ATTR(HasStorage)
+  IGNORED_ATTR(ImplementationOnly)
   IGNORED_ATTR(Implements)
   IGNORED_ATTR(ImplicitlyUnwrappedOptional)
   IGNORED_ATTR(Infix)
@@ -121,67 +125,8 @@ public:
   IGNORED_ATTR(WeakLinked)
   IGNORED_ATTR(DynamicReplacement)
   IGNORED_ATTR(PrivateImport)
+  IGNORED_ATTR(Custom)
 #undef IGNORED_ATTR
-
-  // @noreturn has been replaced with a 'Never' return type.
-  void visitNoReturnAttr(NoReturnAttr *attr) {
-    if (auto FD = dyn_cast<FuncDecl>(D)) {
-      auto &SM = TC.Context.SourceMgr;
-
-      auto diag = TC.diagnose(attr->getLocation(),
-                              diag::noreturn_not_supported);
-      auto range = attr->getRangeWithAt();
-      if (range.isValid())
-        range.End = range.End.getAdvancedLoc(1);
-      diag.fixItRemove(range);
-
-      auto *last = FD->getParameters();
-
-      // If the declaration already has a result type, we're going
-      // to change it to 'Never'.
-      bool hadResultType = false;
-      bool isEndOfLine = false;
-      SourceLoc resultLoc;
-      if (FD->getBodyResultTypeLoc().hasLocation()) {
-        const auto &typeLoc = FD->getBodyResultTypeLoc();
-        hadResultType = true;
-        resultLoc = typeLoc.getSourceRange().Start;
-
-      // If the function 'throws', insert the result type after the
-      // 'throws'.
-      } else {
-        if (FD->getThrowsLoc().isValid()) {
-          resultLoc = FD->getThrowsLoc();
-
-        // Otherwise, insert the result type after the final parameter
-        // list.
-        } else if (last->getRParenLoc().isValid()) {
-          resultLoc = last->getRParenLoc();
-        }
-
-        if (Lexer::getLocForEndOfToken(SM, resultLoc).getAdvancedLoc(1) ==
-            Lexer::getLocForEndOfLine(SM, resultLoc))
-          isEndOfLine = true;
-
-        resultLoc = Lexer::getLocForEndOfToken(SM, resultLoc);
-      }
-
-      if (hadResultType) {
-        diag.fixItReplace(resultLoc, "Never");
-      } else {
-        std::string fix = " -> Never";
-
-        if (!isEndOfLine)
-          fix = fix + " ";
-
-        diag.fixItInsert(resultLoc, fix);
-      }
-
-      auto neverType = TC.Context.getNeverType();
-      if (neverType)
-        FD->getBodyResultTypeLoc() = TypeLoc::withoutLoc(neverType);
-    }
-  }
 
   void visitAlignmentAttr(AlignmentAttr *attr) {
     // Alignment must be a power of two.
@@ -338,11 +283,11 @@ void AttributeEarlyChecker::visitMutationAttr(DeclAttribute *attr) {
     if (contextTy->hasReferenceSemantics()) {
       if (attrModifier != SelfAccessKind::__Consuming)
         diagnoseAndRemoveAttr(attr, diag::mutating_invalid_classes,
-                              unsigned(attrModifier));
+                              attrModifier);
     }
   } else {
     diagnoseAndRemoveAttr(attr, diag::mutating_invalid_global_scope,
-                          unsigned(attrModifier));
+                          attrModifier);
   }
 
   // Verify we don't have more than one of mutating, nonmutating,
@@ -353,24 +298,21 @@ void AttributeEarlyChecker::visitMutationAttr(DeclAttribute *attr) {
     if (auto *NMA = FD->getAttrs().getAttribute<NonMutatingAttr>()) {
       if (attrModifier != SelfAccessKind::NonMutating) {
         diagnoseAndRemoveAttr(NMA, diag::functions_mutating_and_not,
-                              unsigned(SelfAccessKind::NonMutating),
-                              unsigned(attrModifier));
+                              SelfAccessKind::NonMutating, attrModifier);
       }
     }
 
     if (auto *MUA = FD->getAttrs().getAttribute<MutatingAttr>()) {
       if (attrModifier != SelfAccessKind::Mutating) {
         diagnoseAndRemoveAttr(MUA, diag::functions_mutating_and_not,
-                                unsigned(SelfAccessKind::Mutating),
-                                unsigned(attrModifier));
+                                SelfAccessKind::Mutating, attrModifier);
       }
     }
 
     if (auto *CSA = FD->getAttrs().getAttribute<ConsumingAttr>()) {
       if (attrModifier != SelfAccessKind::__Consuming) {
         diagnoseAndRemoveAttr(CSA, diag::functions_mutating_and_not,
-                              unsigned(SelfAccessKind::__Consuming),
-                              unsigned(attrModifier));
+                              SelfAccessKind::__Consuming, attrModifier);
       }
     }
   }
@@ -799,12 +741,14 @@ public:
     void visit##CLASS##Attr(CLASS##Attr *) {}
 
     IGNORED_ATTR(Alignment)
+    IGNORED_ATTR(AlwaysEmitIntoClient)
     IGNORED_ATTR(Borrowed)
     IGNORED_ATTR(HasInitialValue)
     IGNORED_ATTR(ClangImporterSynthesizedType)
     IGNORED_ATTR(Consuming)
     IGNORED_ATTR(Convenience)
     IGNORED_ATTR(Dynamic)
+    IGNORED_ATTR(DynamicReplacement)
     IGNORED_ATTR(Effects)
     IGNORED_ATTR(Exported)
     IGNORED_ATTR(ForbidSerializingReference)
@@ -813,6 +757,7 @@ public:
     IGNORED_ATTR(IBDesignable)
     IGNORED_ATTR(IBInspectable)
     IGNORED_ATTR(IBOutlet) // checked early.
+    IGNORED_ATTR(ImplementationOnly)
     IGNORED_ATTR(ImplicitlyUnwrappedOptional)
     IGNORED_ATTR(Indirect)
     IGNORED_ATTR(Inline)
@@ -821,7 +766,6 @@ public:
     IGNORED_ATTR(Mutating)
     IGNORED_ATTR(NonMutating)
     IGNORED_ATTR(NonObjC)
-    IGNORED_ATTR(NoReturn)
     IGNORED_ATTR(NSManaged) // checked early.
     IGNORED_ATTR(ObjC)
     IGNORED_ATTR(ObjCBridged)
@@ -830,6 +774,7 @@ public:
     IGNORED_ATTR(ObjCRuntimeName)
     IGNORED_ATTR(Optional)
     IGNORED_ATTR(Override)
+    IGNORED_ATTR(PrivateImport)
     IGNORED_ATTR(RawDocComment)
     IGNORED_ATTR(ReferenceOwnership)
     IGNORED_ATTR(RequiresStoredPropertyInits)
@@ -843,8 +788,6 @@ public:
     IGNORED_ATTR(Transparent)
     IGNORED_ATTR(WarnUnqualifiedAccess)
     IGNORED_ATTR(WeakLinked)
-    IGNORED_ATTR(DynamicReplacement)
-    IGNORED_ATTR(PrivateImport)
 #undef IGNORED_ATTR
 
   void visitAvailableAttr(AvailableAttr *attr);
@@ -895,6 +838,7 @@ public:
   void visitFrozenAttr(FrozenAttr *attr);
 
   void visitNonOverrideAttr(NonOverrideAttr *attr);
+  void visitCustomAttr(CustomAttr *attr);
 };
 } // end anonymous namespace
 
@@ -1600,6 +1544,13 @@ void AttributeChecker::visitAccessControlAttr(AccessControlAttr *attr) {
     }
 
     NominalTypeDecl *nominal = extension->getExtendedNominal();
+
+    // Extension is ill-formed; suppress the attribute.
+    if (!nominal) {
+      attr->setInvalid();
+      return;
+    }
+
     AccessLevel typeAccess = nominal->getFormalAccess();
     if (attr->getAccess() > typeAccess) {
       TC.diagnose(attr->getLocation(), diag::access_control_extension_more,
@@ -1633,11 +1584,11 @@ void AttributeChecker::visitAccessControlAttr(AccessControlAttr *attr) {
         auto diag = TC.diagnose(attr->getLocation(),
                                 diag::access_control_ext_member_more,
                                 attr->getAccess(),
-                                D->getDescriptiveKind(),
                                 extAttr->getAccess());
-        swift::fixItAccess(diag, cast<ValueDecl>(D), defaultAccess, false,
-                           true);
-        return;
+        // Don't try to fix this one; it's just a warning, and fixing it can
+        // lead to diagnostic fights between this and "declaration must be at
+        // least this accessible" checking for overrides and protocol
+        // requirements.
       } else if (attr->getAccess() == defaultAccess) {
         TC.diagnose(attr->getLocation(),
                     diag::access_control_ext_member_redundant,
@@ -1645,7 +1596,6 @@ void AttributeChecker::visitAccessControlAttr(AccessControlAttr *attr) {
                     D->getDescriptiveKind(),
                     extAttr->getAccess())
           .fixItRemove(attr->getRange());
-        return;
       }
     }
   }
@@ -1992,6 +1942,16 @@ void AttributeChecker::visitInlinableAttr(InlinableAttr *attr) {
                           access);
     return;
   }
+
+  // @inlinable cannot be applied to deinitializers in resilient classes.
+  if (auto *DD = dyn_cast<DestructorDecl>(D)) {
+    if (auto *CD = dyn_cast<ClassDecl>(DD->getDeclContext())) {
+      if (CD->isResilient()) {
+        diagnoseAndRemoveAttr(attr, diag::inlinable_resilient_deinit);
+        return;
+      }
+    }
+  }
 }
 
 void AttributeChecker::visitOptimizeAttr(OptimizeAttr *attr) {
@@ -2020,8 +1980,8 @@ void AttributeChecker::visitDiscardableResultAttr(DiscardableResultAttr *attr) {
 
 /// Lookup the replaced decl in the replacments scope.
 void lookupReplacedDecl(DeclName replacedDeclName,
-                        DynamicReplacementAttr *attr,
-                        AbstractFunctionDecl *replacement,
+                        const DynamicReplacementAttr *attr,
+                        const ValueDecl *replacement,
                         SmallVectorImpl<ValueDecl *> &results) {
   auto *declCtxt = replacement->getDeclContext();
 
@@ -2031,9 +1991,9 @@ void lookupReplacedDecl(DeclName replacedDeclName,
     declCtxt = storage->getDeclContext();
   }
 
+  auto *moduleScopeCtxt = declCtxt->getModuleScopeContext();
   if (isa<FileUnit>(declCtxt)) {
-    UnqualifiedLookup lookup(replacedDeclName,
-                             replacement->getModuleScopeContext(), nullptr,
+    UnqualifiedLookup lookup(replacedDeclName, moduleScopeCtxt, nullptr,
                              attr->getLocation());
     if (lookup.isSuccess()) {
       for (auto entry : lookup.Results) {
@@ -2048,8 +2008,9 @@ void lookupReplacedDecl(DeclName replacedDeclName,
   if (!typeCtx)
     typeCtx = cast<ExtensionDecl>(declCtxt->getAsDecl())->getExtendedNominal();
 
-  replacement->getModuleScopeContext()->lookupQualified(
-      {typeCtx}, replacedDeclName, NL_QualifiedDefault, results);
+  if (typeCtx)
+    moduleScopeCtxt->lookupQualified({typeCtx}, replacedDeclName,
+                                     NL_QualifiedDefault, results);
 }
 
 /// Remove any argument labels from the interface type of the given value that
@@ -2167,8 +2128,65 @@ static FuncDecl *findReplacedAccessor(DeclName replacedVarName,
 
 static AbstractFunctionDecl *
 findReplacedFunction(DeclName replacedFunctionName,
-                     AbstractFunctionDecl *replacement,
-                     DynamicReplacementAttr *attr, TypeChecker &TC) {
+                     const AbstractFunctionDecl *replacement,
+                     DynamicReplacementAttr *attr, TypeChecker *TC) {
+
+  // Note: we might pass a constant attribute when typechecker is nullptr.
+  // Any modification to attr must be guarded by a null check on TC.
+  //
+  SmallVector<ValueDecl *, 4> results;
+  lookupReplacedDecl(replacedFunctionName, attr, replacement, results);
+
+  for (auto *result : results) {
+    // Check for static/instance mismatch.
+    if (result->isStatic() != replacement->isStatic())
+      continue;
+    if (TC)
+      TC->validateDecl(result);
+    if (result->getInterfaceType()->getCanonicalType()->matches(
+            replacement->getInterfaceType()->getCanonicalType(),
+            TypeMatchFlags::AllowABICompatible)) {
+      if (!result->isDynamic()) {
+        if (TC) {
+          TC->diagnose(attr->getLocation(),
+                       diag::dynamic_replacement_function_not_dynamic,
+                       replacedFunctionName);
+          attr->setInvalid();
+        }
+        return nullptr;
+      }
+      return cast<AbstractFunctionDecl>(result);
+    }
+  }
+
+  if (!TC)
+    return nullptr;
+
+  if (results.empty()) {
+    TC->diagnose(attr->getLocation(),
+                 diag::dynamic_replacement_function_not_found,
+                 attr->getReplacedFunctionName());
+  } else {
+    TC->diagnose(attr->getLocation(),
+                 diag::dynamic_replacement_function_of_type_not_found,
+                 attr->getReplacedFunctionName(),
+                 replacement->getInterfaceType()->getCanonicalType());
+
+    for (auto *result : results) {
+      TC->diagnose(SourceLoc(),
+                   diag::dynamic_replacement_found_function_of_type,
+                   attr->getReplacedFunctionName(),
+                   result->getInterfaceType()->getCanonicalType());
+    }
+  }
+  attr->setInvalid();
+  return nullptr;
+}
+
+static AbstractStorageDecl *
+findReplacedStorageDecl(DeclName replacedFunctionName,
+                        const AbstractStorageDecl *replacement,
+                        const DynamicReplacementAttr *attr) {
 
   SmallVector<ValueDecl *, 4> results;
   lookupReplacedDecl(replacedFunctionName, attr, replacement, results);
@@ -2177,39 +2195,38 @@ findReplacedFunction(DeclName replacedFunctionName,
     // Check for static/instance mismatch.
     if (result->isStatic() != replacement->isStatic())
       continue;
-
-    TC.validateDecl(result);
     if (result->getInterfaceType()->getCanonicalType()->matches(
             replacement->getInterfaceType()->getCanonicalType(),
             TypeMatchFlags::AllowABICompatible)) {
       if (!result->isDynamic()) {
-        TC.diagnose(attr->getLocation(),
-                    diag::dynamic_replacement_function_not_dynamic,
-                    replacedFunctionName);
-        attr->setInvalid();
         return nullptr;
       }
-      return cast<AbstractFunctionDecl>(result);
+      return cast<AbstractStorageDecl>(result);
     }
   }
-  if (results.empty())
-    TC.diagnose(attr->getLocation(),
-                diag::dynamic_replacement_function_not_found,
-                attr->getReplacedFunctionName());
-  else {
-    TC.diagnose(attr->getLocation(),
-                diag::dynamic_replacement_function_of_type_not_found,
-                attr->getReplacedFunctionName(),
-                replacement->getInterfaceType()->getCanonicalType());
-
-    for (auto *result : results) {
-      TC.diagnose(SourceLoc(), diag::dynamic_replacement_found_function_of_type,
-                  attr->getReplacedFunctionName(),
-                  result->getInterfaceType()->getCanonicalType());
-    }
-  }
-  attr->setInvalid();
   return nullptr;
+}
+
+ValueDecl *TypeChecker::findReplacedDynamicFunction(const ValueDecl *vd) {
+  assert(isa<AbstractFunctionDecl>(vd) || isa<AbstractStorageDecl>(vd));
+  if (isa<AccessorDecl>(vd))
+    return nullptr;
+
+  auto *attr = vd->getAttrs().getAttribute<DynamicReplacementAttr>();
+  if (!attr)
+    return nullptr;
+
+  auto *afd = dyn_cast<AbstractFunctionDecl>(vd);
+  if (afd) {
+    // When we pass nullptr as the type checker argument attr is truely const.
+    return findReplacedFunction(attr->getReplacedFunctionName(), afd,
+                                const_cast<DynamicReplacementAttr *>(attr),
+                                nullptr);
+  }
+  auto *storageDecl = dyn_cast<AbstractStorageDecl>(vd);
+  if (!storageDecl)
+    return nullptr;
+  return findReplacedStorageDecl(attr->getReplacedFunctionName(), storageDecl, attr);
 }
 
 void TypeChecker::checkDynamicReplacementAttribute(ValueDecl *D) {
@@ -2260,7 +2277,7 @@ void TypeChecker::checkDynamicReplacementAttribute(ValueDecl *D) {
     // Otherwise, find the matching function.
     auto *fun = cast<AbstractFunctionDecl>(D);
     if (auto *orig = findReplacedFunction(attr->getReplacedFunctionName(), fun,
-                                          attr, *this)) {
+                                          attr, this)) {
       origs.push_back(orig);
       replacements.push_back(fun);
     } else
@@ -2272,7 +2289,23 @@ void TypeChecker::checkDynamicReplacementAttribute(ValueDecl *D) {
     if (auto *attr = replacements[index]
                          ->getAttrs()
                          .getAttribute<DynamicReplacementAttr>()) {
-      attr->setReplacedFunction(origs[index]);
+      auto *replacedFun = origs[index];
+      auto *replacement = replacements[index];
+      if (replacedFun->isObjC() && !replacement->isObjC()) {
+        diagnose(attr->getLocation(),
+                 diag::dynamic_replacement_replacement_not_objc_dynamic,
+                 attr->getReplacedFunctionName());
+        attr->setInvalid();
+        return;
+      }
+      if (!replacedFun->isObjC() && replacement->isObjC()) {
+        diagnose(attr->getLocation(),
+                 diag::dynamic_replacement_replaced_not_objc_dynamic,
+                 attr->getReplacedFunctionName());
+        attr->setInvalid();
+        return;
+      }
+      attr->setReplacedFunction(replacedFun);
       continue;
     }
     auto *newAttr = DynamicReplacementAttr::create(
@@ -2280,6 +2313,22 @@ void TypeChecker::checkDynamicReplacementAttribute(ValueDecl *D) {
     DeclAttributes &attrs = replacements[index]->getAttrs();
     attrs.add(newAttr);
   }
+  if (auto *CD = dyn_cast<ConstructorDecl>(D)) {
+    auto *attr = CD->getAttrs().getAttribute<DynamicReplacementAttr>();
+    auto replacedIsConvenienceInit =
+        cast<ConstructorDecl>(attr->getReplacedFunction())->isConvenienceInit();
+    if (replacedIsConvenienceInit &&!CD->isConvenienceInit()) {
+      diagnose(attr->getLocation(),
+               diag::dynamic_replacement_replaced_constructor_is_convenience,
+               attr->getReplacedFunctionName());
+    } else if (!replacedIsConvenienceInit && CD->isConvenienceInit()) {
+      diagnose(
+          attr->getLocation(),
+          diag::dynamic_replacement_replaced_constructor_is_not_convenience,
+          attr->getReplacedFunctionName());
+    }
+  }
+
 
   // Remove the attribute on the abstract storage (we have moved it to the
   // accessor decl).
@@ -2337,12 +2386,9 @@ void AttributeChecker::visitImplementsAttr(ImplementsAttr *attr) {
 void AttributeChecker::visitFrozenAttr(FrozenAttr *attr) {
   auto *ED = cast<EnumDecl>(D);
 
-  switch (ED->getModuleContext()->getResilienceStrategy()) {
-  case ResilienceStrategy::Default:
+  if (!ED->getModuleContext()->isResilient()) {
     diagnoseAndRemoveAttr(attr, diag::enum_frozen_nonresilient, attr);
     return;
-  case ResilienceStrategy::Resilient:
-    break;
   }
 
   if (ED->getFormalAccess() < AccessLevel::Public &&
@@ -2355,6 +2401,36 @@ void AttributeChecker::visitNonOverrideAttr(NonOverrideAttr *attr) {
   if (auto overrideAttr = D->getAttrs().getAttribute<OverrideAttr>()) {
     diagnoseAndRemoveAttr(overrideAttr, diag::nonoverride_and_override_attr);
   }
+}
+
+void AttributeChecker::visitCustomAttr(CustomAttr *attr) {
+  auto dc = D->getInnermostDeclContext();
+
+  // Figure out which nominal declaration this custom attribute refers to.
+  auto nominal = evaluateOrDefault(
+    TC.Context.evaluator, CustomAttrNominalRequest{attr, dc}, nullptr);
+
+  // If there is no nominal type with this name, complain about this being
+  // an unknown attribute.
+  if (!nominal) {
+    std::string typeName;
+    if (auto typeRepr = attr->getTypeLoc().getTypeRepr()) {
+      llvm::raw_string_ostream out(typeName);
+      typeRepr->print(out);
+    } else {
+      typeName = attr->getTypeLoc().getType().getString();
+    }
+
+    TC.diagnose(attr->getLocation(), diag::unknown_attribute,
+                typeName);
+    attr->setInvalid();
+    return;
+  }
+
+  TC.diagnose(attr->getLocation(), diag::nominal_type_not_attribute,
+              nominal->getDescriptiveKind(), nominal->getFullName());
+  nominal->diagnose(diag::decl_declared_here, nominal->getFullName());
+  attr->setInvalid();
 }
 
 void TypeChecker::checkDeclAttributes(Decl *D) {
@@ -2403,9 +2479,7 @@ void TypeChecker::checkReferenceOwnershipAttr(VarDecl *var,
     }
     break;
   case ReferenceOwnershipOptionality::Allowed:
-    if (!isOptional)
-      break;
-    LLVM_FALLTHROUGH;
+    break;
   case ReferenceOwnershipOptionality::Required:
     if (var->isLet()) {
       diagnose(var->getStartLoc(), diag::invalid_ownership_is_let,
@@ -2413,9 +2487,14 @@ void TypeChecker::checkReferenceOwnershipAttr(VarDecl *var,
       attr->setInvalid();
     }
 
-    // While @IBOutlet can be weak, it must be optional. Let it diagnose.
-    if (!isOptional && !var->getAttrs().hasAttribute<IBOutletAttr>()) {
+    if (!isOptional) {
       attr->setInvalid();
+
+      // @IBOutlet has its own diagnostic when the property type is
+      // non-optional.
+      if (var->getAttrs().hasAttribute<IBOutletAttr>())
+        break;
+
       auto diag = diagnose(var->getStartLoc(),
                            diag::invalid_ownership_not_optional,
                            ownershipKind,
@@ -2517,10 +2596,20 @@ void TypeChecker::addImplicitDynamicAttribute(Decl *D) {
       D->getAttrs().hasAttribute<InlinableAttr>())
     return;
 
+  if (auto *FD = dyn_cast<FuncDecl>(D)) {
+    // Don't add dynamic to defer bodies.
+    if (FD->isDeferBody())
+      return;
+    // Don't add dynamic to functions with a cdecl.
+    if (FD->getAttrs().hasAttribute<CDeclAttr>())
+      return;
+  }
+
   if (auto *VD = dyn_cast<VarDecl>(D)) {
     // Don't turn stored into computed properties. This could conflict with
     // exclusivity checking.
-    if (VD->hasStorage())
+    // If there is a didSet or willSet function we allow dynamic replacement.
+    if (VD->hasStorage() && !VD->getDidSetFunc() && !VD->getWillSetFunc())
       return;
     // Don't add dynamic to local variables.
     if (VD->getDeclContext()->isLocalContext())

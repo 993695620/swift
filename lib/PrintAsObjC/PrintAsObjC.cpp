@@ -322,14 +322,22 @@ private:
   void visitClassDecl(ClassDecl *CD) {
     printDocumentationComment(CD);
 
+    bool hasResilientAncestry =
+      CD->checkAncestry().contains(AncestryFlags::ResilientOther);
+    if (hasResilientAncestry) {
+      os << "SWIFT_RESILIENT_CLASS";
+    } else {
+      os << "SWIFT_CLASS";
+    }
+
     StringRef customName = getNameForObjC(CD, CustomNamesOnly);
     if (customName.empty()) {
       llvm::SmallString<32> scratch;
-      os << "SWIFT_CLASS(\"" << CD->getObjCRuntimeName(scratch) << "\")";
+      os << "(\"" << CD->getObjCRuntimeName(scratch) << "\")";
       printAvailability(CD);
       os << "\n@interface " << CD->getName();
     } else {
-      os << "SWIFT_CLASS_NAMED(\"" << CD->getName() << "\")";
+      os << "_NAMED(\"" << CD->getName() << "\")";
       printAvailability(CD);
       os << "\n@interface " << customName;
     }
@@ -1071,7 +1079,7 @@ private:
   /// thereof.
   bool isCFTypeRef(Type ty) {
     const TypeAliasDecl *TAD = nullptr;
-    while (auto aliasTy = dyn_cast<NameAliasType>(ty.getPointer())) {
+    while (auto aliasTy = dyn_cast<TypeAliasType>(ty.getPointer())) {
       TAD = aliasTy->getDecl();
       ty = aliasTy->getSinglyDesugaredType();
     }
@@ -1122,7 +1130,7 @@ private:
 
     ASTContext &ctx = M.getASTContext();
     bool isSettable = VD->isSettable(nullptr);
-    if (isSettable && ctx.LangOpts.EnableAccessControl)
+    if (isSettable && !ctx.isAccessControlDisabled())
       isSettable = (VD->getSetterFormalAccess() >= minRequiredAccess);
     if (!isSettable)
       os << ", readonly";
@@ -1612,7 +1620,7 @@ private:
     return true;
   }
 
-  void visitNameAliasType(NameAliasType *aliasTy,
+  void visitTypeAliasType(TypeAliasType *aliasTy,
                                Optional<OptionalTypeKind> optionalKind) {
     const TypeAliasDecl *alias = aliasTy->getDecl();
     if (printIfKnownSimpleType(alias, optionalKind))
@@ -2053,7 +2061,7 @@ class ReferencedTypeFinder : public TypeVisitor<ReferencedTypeFinder> {
     llvm_unreachable("unhandled type");
   }
 
-  void visitNameAliasType(NameAliasType *aliasTy) {
+  void visitTypeAliasType(TypeAliasType *aliasTy) {
     if (aliasTy->getDecl()->hasClangNode() &&
         !aliasTy->getDecl()->isCompatibilityAlias()) {
       Callback(*this, aliasTy->getDecl());
@@ -2511,7 +2519,7 @@ public:
       });
       if (!hasDomainCase) {
         os << "static NSString * _Nonnull const " << getNameForObjC(ED)
-           << "Domain = @\"" << M.getName() << "." << ED->getName() << "\";\n";
+           << "Domain = @\"" << getErrorDomainStringForObjC(ED) << "\";\n";
       }
     }
 
@@ -2638,6 +2646,20 @@ public:
            "#  define SWIFT_CLASS_NAMED(SWIFT_NAME) "
              "SWIFT_COMPILE_NAME(SWIFT_NAME) "
              "SWIFT_CLASS_EXTRA\n"
+           "# endif\n"
+           "#endif\n"
+           "#if !defined(SWIFT_RESILIENT_CLASS)\n"
+           "# if __has_attribute(objc_class_stub)\n"
+           "#  define SWIFT_RESILIENT_CLASS(SWIFT_NAME) SWIFT_CLASS(SWIFT_NAME) "
+             "__attribute__((objc_class_stub))\n"
+           "#  define SWIFT_RESILIENT_CLASS_NAMED(SWIFT_NAME) "
+             "__attribute__((objc_class_stub)) "
+             "SWIFT_CLASS_NAMED(SWIFT_NAME)\n"
+           "# else\n"
+           "#  define SWIFT_RESILIENT_CLASS(SWIFT_NAME) "
+             "SWIFT_CLASS(SWIFT_NAME)\n"
+           "#  define SWIFT_RESILIENT_CLASS_NAMED(SWIFT_NAME) "
+             "SWIFT_CLASS_NAMED(SWIFT_NAME)\n"
            "# endif\n"
            "#endif\n"
            "\n"

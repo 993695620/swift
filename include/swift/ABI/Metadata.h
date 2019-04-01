@@ -706,7 +706,7 @@ public:
 #endif
 
 #ifndef NDEBUG
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
+  LLVM_ATTRIBUTE_DEPRECATED(void dump() const,
                             "Only meant for use in the debugger");
 #endif
 
@@ -1078,11 +1078,11 @@ public:
   /// created for various dynamic purposes like KVO?
   bool isArtificialSubclass() const {
     assert(isTypeMetadata());
-    return Description == 0;
+    return Description == nullptr;
   }
   void setArtificialSubclass() {
     assert(isTypeMetadata());
-    Description = 0;
+    Description = nullptr;
   }
 
   ClassFlags getFlags() const {
@@ -1190,6 +1190,31 @@ public:
       bounds.PositiveSizeInWords = rootBounds.PositiveSizeInWords;
 
     return bounds;
+  }
+
+  /// Given a statically-emitted metadata template, this sets the correct
+  /// "is Swift" bit for the current runtime. Depending on the deployment
+  /// target a binary was compiled for, statically emitted metadata templates
+  /// may have a different bit set from the one that this runtime canonically
+  /// considers the "is Swift" bit.
+  void setAsTypeMetadata() {
+    // If the wrong "is Swift" bit is set, set the correct one.
+    //
+    // Note that the only time we should see the "new" bit set while
+    // expecting the "old" one is when running a binary built for a
+    // new OS on an old OS, which is not supported, however we do
+    // have tests that exercise this scenario.
+    auto otherSwiftBit = (3ULL - SWIFT_CLASS_IS_SWIFT_MASK);
+    assert(otherSwiftBit == 1ULL || otherSwiftBit == 2ULL);
+
+    if ((this->Data & 3) == otherSwiftBit) {
+      this->Data ^= 3;
+    }
+
+    // Otherwise there should be nothing to do, since only the old "is
+    // Swift" bit is used for backward-deployed runtimes.
+    
+    assert(isTypeMetadata());
   }
 
   static bool classof(const TargetMetadata<Runtime> *metadata) {
@@ -1321,7 +1346,7 @@ struct TargetStructMetadata : public TargetValueMetadata<Runtime> {
   }
 
   static constexpr int32_t getGenericArgumentOffset() {
-    return sizeof(TargetStructMetadata<Runtime>) / sizeof(void*);
+    return sizeof(TargetStructMetadata<Runtime>) / sizeof(StoredPointer);
   }
 
   static bool classof(const TargetMetadata<Runtime> *metadata) {
@@ -1369,7 +1394,7 @@ struct TargetEnumMetadata : public TargetValueMetadata<Runtime> {
   }
 
   static constexpr int32_t getGenericArgumentOffset() {
-    return sizeof(TargetEnumMetadata<Runtime>) / sizeof(void*);
+    return sizeof(TargetEnumMetadata<Runtime>) / sizeof(StoredPointer);
   }
 
   static bool classof(const TargetMetadata<Runtime> *metadata) {
@@ -1547,10 +1572,10 @@ class TargetProtocolDescriptorRef {
   /// is clear).
   StoredPointer storage;
 
+public:
   constexpr TargetProtocolDescriptorRef(StoredPointer storage)
     : storage(storage) { }
 
-public:
   constexpr TargetProtocolDescriptorRef() : storage() { }
 
   TargetProtocolDescriptorRef(
@@ -1645,7 +1670,11 @@ public:
     assert(!isObjC());
 #endif
 
-    return reinterpret_cast<ProtocolDescriptorPointer>(storage & ~IsObjCBit);
+    // NOTE: we explicitly use a C-style cast here because cl objects to the
+    // reinterpret_cast from a uintptr_t type to an unsigned type which the
+    // Pointer type may be depending on the instantiation.  Using the C-style
+    // cast gives us a single path irrespective of the template type parameters.
+    return (ProtocolDescriptorPointer)(storage & ~IsObjCBit);
   }
 
   /// Retrieve the raw stored pointer and discriminator bit.
@@ -2039,7 +2068,8 @@ struct TargetGenericWitnessTable {
     return WitnessTablePrivateSizeInWordsAndRequiresInstantiation >> 1;
   }
 
-  /// Whether the witness table is known to require instantiation.
+  /// This bit doesn't really mean anything. Currently, the compiler always
+  /// sets it when emitting a generic witness table.
   uint16_t requiresInstantiation() const {
     return WitnessTablePrivateSizeInWordsAndRequiresInstantiation & 0x01;
   }
@@ -2374,7 +2404,7 @@ public:
   ///
   /// 1. Has a valid TypeReferenceKind.
   /// 2. Has a valid conformance kind.
-  void verify() const LLVM_ATTRIBUTE_USED;
+  void verify() const;
 #endif
 
 private:
@@ -2519,7 +2549,6 @@ public:
   /// The type that's constrained, described as a mangled name.
   RelativeDirectPointer<const char, /*nullable*/ false> Param;
 
-private:
   union {
     /// A mangled representation of the same-type or base class the param is
     /// constrained to.
@@ -2544,7 +2573,6 @@ private:
     GenericRequirementLayoutKind Layout;
   };
 
-public:
   constexpr GenericRequirementFlags getFlags() const {
     return Flags;
   }
@@ -2784,6 +2812,7 @@ private:
   using TrailingGenericContextObjects
     = TrailingGenericContextObjects<TargetExtensionContextDescriptor<Runtime>>;
 
+public:
   /// A mangling of the `Self` type context that the extension extends.
   /// The mangled name represents the type in the generic context encoded by
   /// this descriptor. For example, a nongeneric nominal type extension will
@@ -2794,7 +2823,6 @@ private:
   /// extension is declared inside.
   RelativeDirectPointer<const char> ExtendedContext;
 
-public:
   using TrailingGenericContextObjects::getGenericContext;
 
   StringRef getMangledExtendedContext() const {
@@ -2809,21 +2837,79 @@ public:
 using ExtensionContextDescriptor = TargetExtensionContextDescriptor<InProcess>;
 
 template<typename Runtime>
+struct TargetMangledContextName {
+  /// The mangled name of the context.
+  TargetRelativeDirectPointer<Runtime, const char, /*nullable*/ false> name;
+};
+
+template<typename Runtime>
 struct TargetAnonymousContextDescriptor final
     : TargetContextDescriptor<Runtime>,
-      TrailingGenericContextObjects<TargetAnonymousContextDescriptor<Runtime>>
+      TrailingGenericContextObjects<TargetAnonymousContextDescriptor<Runtime>,
+                                    TargetGenericContextDescriptorHeader,
+                                    TargetMangledContextName<Runtime>>
 {
 private:
   using TrailingGenericContextObjects
-    = TrailingGenericContextObjects<TargetAnonymousContextDescriptor<Runtime>>;
+    = TrailingGenericContextObjects<TargetAnonymousContextDescriptor<Runtime>,
+                                    TargetGenericContextDescriptorHeader,
+                                    TargetMangledContextName<Runtime>>;
+  using TrailingObjects =
+    typename TrailingGenericContextObjects::TrailingObjects;
+  friend TrailingObjects;
 
 public:
-  using TrailingGenericContextObjects::getGenericContext;
+  using MangledContextName = TargetMangledContextName<Runtime>;
 
+  using TrailingGenericContextObjects::getGenericContext;
+  using TrailingGenericContextObjects::getGenericContextHeader;
+  using TrailingGenericContextObjects::getFullGenericContextHeader;
+  using TrailingGenericContextObjects::getGenericParams;
+
+  AnonymousContextDescriptorFlags getAnonymousContextDescriptorFlags() const {
+    return AnonymousContextDescriptorFlags(this->Flags.getKindSpecificFlags());
+  }
+
+  /// Whether this anonymous context descriptor contains a full mangled name,
+  /// which can be used to match the anonymous type to its textual form.
+  bool hasMangledName() const {
+    return getAnonymousContextDescriptorFlags().hasMangledName();
+  }
+
+  /// Retrieve the mangled name of this context, or NULL if it was not
+  /// recorded in the metadata.
+  ConstTargetPointer<Runtime, char> getMangledName() const {
+    if (!hasMangledName())
+      return ConstTargetPointer<Runtime, char>();
+
+    return this->template getTrailingObjects<MangledContextName>()->name;
+  }
+
+  /// Retrieve a pointer to the mangled context name structure.
+  const MangledContextName *getMangledContextName() const {
+    if (!hasMangledName())
+      return nullptr;
+
+    return this->template getTrailingObjects<MangledContextName>();
+  }
+
+private:
+  template<typename T>
+  using OverloadToken =
+    typename TrailingGenericContextObjects::template OverloadToken<T>;
+
+  using TrailingGenericContextObjects::numTrailingObjects;
+
+  size_t numTrailingObjects(OverloadToken<MangledContextName>) const {
+    return this->hasMangledNam() ? 1 : 0;
+  }
+
+public:
   static bool classof(const TargetContextDescriptor<Runtime> *cd) {
     return cd->getKind() == ContextDescriptorKind::Anonymous;
   }
 };
+using AnonymousContextDescriptor = TargetAnonymousContextDescriptor<InProcess>;
 
 /// A protocol descriptor.
 ///
@@ -2911,7 +2997,7 @@ public:
   }
 
 #ifndef NDEBUG
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
+  LLVM_ATTRIBUTE_DEPRECATED(void dump() const,
                             "only for use in the debugger");
 #endif
 
@@ -3480,11 +3566,11 @@ public:
   llvm::ArrayRef<GenericParamDescriptor> getGenericParams() const;
 
   /// Return the offset of the start of generic arguments in the nominal
-  /// type's metadata. The returned value is measured in sizeof(void*).
+  /// type's metadata. The returned value is measured in sizeof(StoredPointer).
   int32_t getGenericArgumentOffset() const;
 
   /// Return the start of the generic arguments array in the nominal
-  /// type's metadata. The returned value is measured in sizeof(void*).
+  /// type's metadata. The returned value is measured in sizeof(StoredPointer).
   const TargetMetadata<Runtime> * const *getGenericArguments(
                                const TargetMetadata<Runtime> *metadata) const {
     auto offset = getGenericArgumentOffset();
@@ -3597,6 +3683,28 @@ struct TargetResilientSuperclass {
   TargetRelativeDirectPointer<Runtime, const void, /*nullable*/true> Superclass;
 };
 
+/// A structure that stores a reference to an Objective-C class stub.
+///
+/// This is not the class stub itself; it is part of a class context
+/// descriptor.
+template <typename Runtime>
+struct TargetObjCResilientClassStubInfo {
+  /// A relative pointer to an Objective-C resilient class stub.
+  ///
+  /// We do not declare a struct type for class stubs since the Swift runtime
+  /// does not need to interpret them. The class stub struct is part of
+  /// the Objective-C ABI, and is laid out as follows:
+  /// - isa pointer, always 1
+  /// - an update callback, of type 'Class (*)(Class *, objc_class_stub *)'
+  ///
+  /// Class stubs are used for two purposes:
+  ///
+  /// - Objective-C can reference class stubs when calling static methods.
+  /// - Objective-C and Swift can reference class stubs when emitting
+  ///   categories (in Swift, extensions with @objc members).
+  TargetRelativeDirectPointer<Runtime, const void> Stub;
+};
+
 template <typename Runtime>
 class TargetClassDescriptor final
     : public TargetTypeContextDescriptor<Runtime>,
@@ -3609,7 +3717,8 @@ class TargetClassDescriptor final
                               TargetVTableDescriptorHeader<Runtime>,
                               TargetMethodDescriptor<Runtime>,
                               TargetOverrideTableHeader<Runtime>,
-                              TargetMethodOverrideDescriptor<Runtime>> {
+                              TargetMethodOverrideDescriptor<Runtime>,
+                              TargetObjCResilientClassStubInfo<Runtime>> {
 private:
   using TrailingGenericContextObjects =
     TrailingGenericContextObjects<TargetClassDescriptor<Runtime>,
@@ -3620,7 +3729,8 @@ private:
                                   TargetVTableDescriptorHeader<Runtime>,
                                   TargetMethodDescriptor<Runtime>,
                                   TargetOverrideTableHeader<Runtime>,
-                                  TargetMethodOverrideDescriptor<Runtime>>;
+                                  TargetMethodOverrideDescriptor<Runtime>,
+                                  TargetObjCResilientClassStubInfo<Runtime>>;
 
   using TrailingObjects =
     typename TrailingGenericContextObjects::TrailingObjects;
@@ -3636,6 +3746,8 @@ public:
     TargetForeignMetadataInitialization<Runtime>;
   using SingletonMetadataInitialization =
     TargetSingletonMetadataInitialization<Runtime>;
+  using ObjCResilientClassStubInfo =
+    TargetObjCResilientClassStubInfo<Runtime>;
 
   using StoredPointer = typename Runtime::StoredPointer;
   using StoredPointerDifference = typename Runtime::StoredPointerDifference;
@@ -3673,7 +3785,9 @@ public:
     /// positive size of metadata objects of this class (in words).
     uint32_t MetadataPositiveSizeInWords;
 
-    // Maybe add something here that's useful only for resilient types?
+    /// Otherwise, these flags are used to do things like indicating
+    /// the presence of an Objective-C resilient class stub.
+    ExtraClassDescriptorFlags ExtraClassFlags;
   };
 
   /// The number of additional members added by this class to the class
@@ -3747,6 +3861,10 @@ private:
       return 0;
 
     return getOverrideTable()->NumEntries;
+  }
+
+  size_t numTrailingObjects(OverloadToken<ObjCResilientClassStubInfo>) const {
+    return hasObjCResilientClassStub() ? 1 : 0;
   }
 
 public:
@@ -3868,7 +3986,24 @@ public:
            && i < numTrailingObjects(OverloadToken<MethodDescriptor>{}));
     return getMethodDescriptors()[i].Impl.get();
   }
-  
+
+  /// Whether this context descriptor references an Objective-C resilient
+  /// class stub. See the above description of TargetObjCResilientClassStubInfo
+  /// for details.
+  bool hasObjCResilientClassStub() const {
+    if (!hasResilientSuperclass())
+      return false;
+    return ExtraClassFlags.hasObjCResilientClassStub();
+  }
+
+  const void *getObjCResilientClassStub() const {
+    if (!hasObjCResilientClassStub())
+      return nullptr;
+
+    return this->template getTrailingObjects<ObjCResilientClassStubInfo>()
+      ->Stub.get();
+  }
+
   static bool classof(const TargetContextDescriptor<Runtime> *cd) {
     return cd->getKind() == ContextDescriptorKind::Class;
   }

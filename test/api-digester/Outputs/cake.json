@@ -59,7 +59,7 @@
       "declKind": "Protocol",
       "usr": "s:4cake2P3P",
       "moduleName": "cake",
-      "genericSig": "<Self : P1, Self : P2>",
+      "genericSig": "<Self : cake.P1, Self : cake.P2>",
       "conformances": [
         {
           "kind": "Conformance",
@@ -1004,7 +1004,7 @@
       "declKind": "Protocol",
       "usr": "s:4cake4PSubP",
       "moduleName": "cake",
-      "genericSig": "<Self : PSuper>",
+      "genericSig": "<Self : cake.PSuper>",
       "conformances": [
         {
           "kind": "Conformance",
@@ -1092,8 +1092,8 @@
       "conformances": [
         {
           "kind": "Conformance",
-          "name": "Comparable",
-          "printedName": "Comparable"
+          "name": "FixedWidthInteger",
+          "printedName": "FixedWidthInteger"
         },
         {
           "kind": "Conformance",
@@ -1216,13 +1216,23 @@
         },
         {
           "kind": "Conformance",
-          "name": "FixedWidthInteger",
-          "printedName": "FixedWidthInteger"
+          "name": "Comparable",
+          "printedName": "Comparable"
         },
         {
           "kind": "Conformance",
           "name": "P1",
           "printedName": "P1"
+        },
+        {
+          "kind": "Conformance",
+          "name": "MirrorPath",
+          "printedName": "MirrorPath"
+        },
+        {
+          "kind": "Conformance",
+          "name": "CVarArg",
+          "printedName": "CVarArg"
         },
         {
           "kind": "Conformance",
@@ -1248,11 +1258,6 @@
           "kind": "Conformance",
           "name": "CustomReflectable",
           "printedName": "CustomReflectable"
-        },
-        {
-          "kind": "Conformance",
-          "name": "MirrorPath",
-          "printedName": "MirrorPath"
         },
         {
           "kind": "Conformance",
@@ -1358,11 +1363,6 @@
               ]
             }
           ]
-        },
-        {
-          "kind": "Conformance",
-          "name": "CVarArg",
-          "printedName": "CVarArg"
         }
       ]
     }

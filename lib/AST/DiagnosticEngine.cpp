@@ -331,7 +331,7 @@ static void formatSelectionArgument(StringRef ModifierArguments,
 static bool isInterestingTypealias(Type type) {
   // Dig out the typealias declaration, if there is one.
   TypeAliasDecl *aliasDecl = nullptr;
-  if (auto aliasTy = dyn_cast<NameAliasType>(type.getPointer()))
+  if (auto aliasTy = dyn_cast<TypeAliasType>(type.getPointer()))
     aliasDecl = aliasTy->getDecl();
   else
     return false;
@@ -473,6 +473,18 @@ static void formatDiagnosticArgument(StringRef Modifier,
   case DiagnosticArgumentKind::PatternKind:
     assert(Modifier.empty() && "Improper modifier for PatternKind argument");
     Out << Arg.getAsPatternKind();
+    break;
+
+  case DiagnosticArgumentKind::SelfAccessKind:
+    if (Modifier == "select") {
+      formatSelectionArgument(ModifierArguments, Args,
+                              unsigned(Arg.getAsSelfAccessKind()),
+                              FormatOpts, Out);
+    } else {
+      assert(Modifier.empty() &&
+             "Improper modifier for SelfAccessKind argument");
+      Out << Arg.getAsSelfAccessKind();
+    }
     break;
 
   case DiagnosticArgumentKind::ReferenceOwnership:
@@ -767,6 +779,7 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
             case DeclContextKind::AbstractClosureExpr:
             case DeclContextKind::AbstractFunctionDecl:
             case DeclContextKind::SubscriptDecl:
+            case DeclContextKind::EnumElementDecl:
               break;
             }
 

@@ -47,6 +47,7 @@ namespace swift {
   enum class AccessSemantics : unsigned char;
   class AccessorDecl;
   class ApplyExpr;
+  class AvailabilityContext;
   class GenericEnvironment;
   class ArchetypeType;
   class ASTContext;
@@ -211,6 +212,15 @@ struct OverloadSignature {
 
   /// Whether this is a function.
   unsigned IsFunction : 1;
+
+  /// Whether this is a enum element.
+  unsigned IsEnumElement : 1;
+
+  /// Whether this is a nominal type.
+  unsigned IsNominal : 1;
+
+  /// Whether this is a type alias.
+  unsigned IsTypeAlias : 1;
 
   /// Whether this signature is part of a protocol extension.
   unsigned InProtocolExtension : 1;
@@ -493,7 +503,7 @@ protected:
     HasLazyConformances : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+2+8+16,
+  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+2+1+8+16,
     /// Whether the \c RequiresClass bit is valid.
     RequiresClassValid : 1,
 
@@ -519,6 +529,9 @@ protected:
     /// The stage of the circularity check for this protocol.
     Circularity : 2,
 
+    /// Whether we've computed the inherited protocols list yet.
+    InheritedProtocolsValid : 1,
+
     : NumPadBits,
 
     /// If this is a compiler-known protocol, this will be a KnownProtocolKind
@@ -529,7 +542,7 @@ protected:
     NumRequirementsInSignature : 16
   );
 
-  SWIFT_INLINE_BITFIELD(ClassDecl, NominalTypeDecl, 1+2+1+2+1+3+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ClassDecl, NominalTypeDecl, 1+2+1+2+1+6+1+1+1,
     /// Whether this class requires all of its instance variables to
     /// have in-class initializers.
     RequiresStoredPropertyInits : 1,
@@ -550,12 +563,11 @@ protected:
     /// control inserting the implicit destructor.
     HasDestructorDecl : 1,
 
-    /// Whether the class has @objc ancestry.
-    ObjCKind : 3,
+    /// Information about the class's ancestry.
+    Ancestry : 6,
 
-    /// Whether this class has @objc members.
-    HasObjCMembersComputed : 1,
-    HasObjCMembers : 1,
+    /// Whether we have computed the above field or not.
+    AncestryComputed : 1,
 
     HasMissingDesignatedInitializers : 1,
     HasMissingVTableEntries : 1
@@ -937,7 +949,8 @@ public:
   bool isPrivateStdlibDecl(bool treatNonBuiltinProtocolsAsPublic = true) const;
 
   /// Whether this declaration is weak-imported.
-  bool isWeakImported(ModuleDecl *fromModule) const;
+  bool isWeakImported(ModuleDecl *fromModule,
+                      AvailabilityContext fromContext) const;
 
   /// Returns true if the nature of this declaration allows overrides.
   /// Note that this does not consider whether it is final or whether
@@ -2412,6 +2425,10 @@ public:
 
   bool isUsableFromInline() const;
 
+  /// Returns \c true if this declaration is *not* intended to be used directly
+  /// by application developers despite the visibility.
+  bool shouldHideFromEditor() const;
+
   bool hasAccess() const {
     return TypeAndAccess.getInt().hasValue();
   }
@@ -3527,20 +3544,32 @@ enum class ArtificialMainKind : uint8_t {
   UIApplicationMain,
 };
 
-enum class ObjCClassKind : uint8_t {
-  /// Neither the class nor any of its superclasses are @objc.
-  NonObjC,
-  /// One of the superclasses is @objc but another superclass or the
-  /// class itself has generic parameters, so while it cannot be
-  /// directly represented in Objective-C, it has implicitly @objc
-  /// members.
-  ObjCMembers,
-  /// The top-level ancestor of this class is not @objc, but the
-  /// class itself is.
-  ObjCWithSwiftRoot,
-  /// The class is bona-fide @objc.
-  ObjC,
+/// This is the base type for AncestryOptions. Each flag describes possible
+/// interesting kinds of superclasses that a class may have.
+enum class AncestryFlags : uint8_t {
+  /// The class or one of its superclasses is @objc.
+  ObjC = (1<<0),
+
+  /// The class or one of its superclasses is @objcMembers.
+  ObjCMembers = (1<<1),
+
+  /// The class or one of its superclasses is generic.
+  Generic = (1<<2),
+
+  /// The class or one of its superclasses is resilient.
+  Resilient = (1<<3),
+
+  /// The class or one of its superclasses has resilient metadata and is in a
+  /// different resilience domain.
+  ResilientOther = (1<<4),
+
+  /// The class or one of its superclasses is imported from Clang.
+  ClangImported = (1<<5),
 };
+
+/// Return type of ClassDecl::checkAncestry(). Describes a set of interesting
+/// kinds of superclasses that a class may have.
+using AncestryOptions = OptionSet<AncestryFlags>;
 
 /// ClassDecl - This is the declaration of a class, for example:
 ///
@@ -3558,15 +3587,18 @@ class ClassDecl final : public NominalTypeDecl {
   void createObjCMethodLookup();
 
   struct {
+    /// The superclass decl and a bit to indicate whether the
+    /// superclass was computed yet or not.
+    llvm::PointerIntPair<ClassDecl *, 1, bool> SuperclassDecl;
+
     /// The superclass type and a bit to indicate whether the
     /// superclass was computed yet or not.
-    llvm::PointerIntPair<Type, 1, bool> Superclass;
+    llvm::PointerIntPair<Type, 1, bool> SuperclassType;
   } LazySemanticInfo;
 
+  friend class SuperclassDeclRequest;
   friend class SuperclassTypeRequest;
   friend class TypeChecker;
-
-  bool hasObjCMembersSlow();
 
 public:
   ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
@@ -3599,6 +3631,9 @@ public:
   /// is no superclass.
   ClassDecl *getSuperclassDecl() const;
 
+  /// Check if this class is a superclass or equal to the given class.
+  bool isSuperclassOf(ClassDecl *other) const;
+
   /// Set the superclass of this class.
   void setSuperclass(Type superclass);
 
@@ -3611,6 +3646,19 @@ public:
   void setCircularityCheck(CircularityCheck circularity) {
     Bits.ClassDecl.Circularity = static_cast<unsigned>(circularity);
   }
+
+  /// Walk this class and all of the superclasses of this class, transitively,
+  /// invoking the callback function for each class.
+  ///
+  /// \param fn The callback function that will be invoked for each superclass.
+  /// It can return \c Continue to continue the traversal. Returning
+  /// \c SkipChildren halts the search and returns \c false, while returning
+  /// \c Stop halts the search and returns \c true.
+  ///
+  /// \returns \c true if \c fn returned \c Stop for any class, \c false
+  /// otherwise.
+  bool walkSuperclasses(
+      llvm::function_ref<TypeWalker::Action(ClassDecl *)> fn) const;
 
   //// Whether this class requires all of its stored properties to
   //// have initializers in the class definition.
@@ -3726,18 +3774,13 @@ public:
     Bits.ClassDecl.InheritsSuperclassInits = true;
   }
 
-  /// Returns if this class has any @objc ancestors, or if it is directly
-  /// visible to Objective-C. The latter is a stronger condition which is only
-  /// true if the class does not have any generic ancestry.
-  ObjCClassKind checkObjCAncestry() const;
+  /// Walks the class hierarchy starting from this class, checking various
+  /// conditions.
+  AncestryOptions checkAncestry() const;
 
-  /// Returns if the class has implicitly @objc members. This is true if any
-  /// ancestor class has the @objcMembers attribute.
-  bool hasObjCMembers() const {
-    if (Bits.ClassDecl.HasObjCMembersComputed)
-      return Bits.ClassDecl.HasObjCMembers;
-
-    return const_cast<ClassDecl *>(this)->hasObjCMembersSlow();
+  /// Check if the class has ancestry of the given kind.
+  bool checkAncestry(AncestryFlags flag) const {
+    return checkAncestry().contains(flag);
   }
 
   /// The type of metaclass to use for a class.
@@ -3884,6 +3927,18 @@ private:
 class ProtocolDecl final : public NominalTypeDecl {
   SourceLoc ProtocolLoc;
 
+  ArrayRef<ProtocolDecl *> InheritedProtocols;
+
+  struct {
+    /// The superclass decl and a bit to indicate whether the
+    /// superclass was computed yet or not.
+    llvm::PointerIntPair<ClassDecl *, 1, bool> SuperclassDecl;
+
+    /// The superclass type and a bit to indicate whether the
+    /// superclass was computed yet or not.
+    llvm::PointerIntPair<Type, 1, bool> SuperclassType;
+  } LazySemanticInfo;
+
   /// The generic signature representing exactly the new requirements introduced
   /// by this protocol.
   const Requirement *RequirementSignature = nullptr;
@@ -3894,12 +3949,9 @@ class ProtocolDecl final : public NominalTypeDecl {
 
   bool existentialTypeSupportedSlow(LazyResolver *resolver);
 
-  struct {
-    /// The superclass type and a bit to indicate whether the
-    /// superclass was computed yet or not.
-    llvm::PointerIntPair<Type, 1, bool> Superclass;
-  } LazySemanticInfo;
+  ArrayRef<ProtocolDecl *> getInheritedProtocolsSlow();
 
+  friend class SuperclassDeclRequest;
   friend class SuperclassTypeRequest;
   friend class TypeChecker;
 
@@ -3911,7 +3963,12 @@ public:
   using Decl::getASTContext;
 
   /// Retrieve the set of protocols inherited from this protocol.
-  llvm::TinyPtrVector<ProtocolDecl *> getInheritedProtocols() const;
+  ArrayRef<ProtocolDecl *> getInheritedProtocols() const {
+    if (Bits.ProtocolDecl.InheritedProtocolsValid)
+      return InheritedProtocols;
+
+    return const_cast<ProtocolDecl *>(this)->getInheritedProtocolsSlow();
+  }
 
   /// Determine whether this protocol has a superclass.
   bool hasSuperclass() const { return (bool)getSuperclassDecl(); }
@@ -3931,8 +3988,8 @@ public:
   /// a protocol having nested types (ObjC protocols).
   llvm::TinyPtrVector<AssociatedTypeDecl *> getAssociatedTypeMembers() const;
 
-  /// Walk all of the protocols inherited by this protocol, transitively,
-  /// invoking the callback function for each protocol.
+  /// Walk this protocol and all of the protocols inherited by this protocol,
+  /// transitively, invoking the callback function for each protocol.
   ///
   /// \param fn The callback function that will be invoked for each inherited
   /// protocol. It can return \c Continue to continue the traversal,
@@ -4027,14 +4084,20 @@ public:
     Bits.ProtocolDecl.ExistentialTypeSupportedValid = true;
   }
 
+private:
+  void computeKnownProtocolKind() const;
+
+public:
   /// If this is known to be a compiler-known protocol, returns the kind.
   /// Otherwise returns None.
-  ///
-  /// Note that this is only valid after type-checking.
   Optional<KnownProtocolKind> getKnownProtocolKind() const {
     if (Bits.ProtocolDecl.KnownProtocol == 0)
+      computeKnownProtocolKind();
+
+    if (Bits.ProtocolDecl.KnownProtocol == 1)
       return None;
-    return static_cast<KnownProtocolKind>(Bits.ProtocolDecl.KnownProtocol - 1);
+    
+    return static_cast<KnownProtocolKind>(Bits.ProtocolDecl.KnownProtocol - 2);
   }
 
   /// Check whether this protocol is of a specific, known protocol kind.
@@ -4043,15 +4106,6 @@ public:
       return *knownKind == kind;
 
     return false;
-  }
-
-  /// Records that this is a compiler-known protocol.
-  void setKnownProtocolKind(KnownProtocolKind kind) {
-    assert((!getKnownProtocolKind() || *getKnownProtocolKind() == kind) &&
-           "can't reset known protocol kind");
-    Bits.ProtocolDecl.KnownProtocol = static_cast<unsigned>(kind) + 1;
-    assert(getKnownProtocolKind() && *getKnownProtocolKind() == kind &&
-           "not enough bits");
   }
 
   /// Retrieve the status of circularity checking for protocol inheritance.
@@ -4524,6 +4578,11 @@ public:
   /// other modules.
   bool exportsPropertyDescriptor() const;
 
+  /// True if any of the accessors to the storage is private or fileprivate.
+  bool hasPrivateAccessor() const;
+
+  bool hasDidSetOrWillSetDynamicReplacement() const;
+
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Decl *D) {
     return D->getKind() >= DeclKind::First_AbstractStorageDecl &&
@@ -4549,7 +4608,7 @@ public:
   };
 
 protected:
-  llvm::PointerUnion<PatternBindingDecl*, Stmt*> ParentPattern;
+  PointerUnion3<PatternBindingDecl *, Stmt *, VarDecl *> Parent;
 
   VarDecl(DeclKind Kind, bool IsStatic, Specifier Sp, bool IsCaptureList,
           SourceLoc NameLoc, Identifier Name, DeclContext *DC)
@@ -4620,12 +4679,15 @@ public:
   /// Return the parent pattern binding that may provide an initializer for this
   /// VarDecl.  This returns null if there is none associated with the VarDecl.
   PatternBindingDecl *getParentPatternBinding() const {
-    return ParentPattern.dyn_cast<PatternBindingDecl *>();
+    if (!Parent)
+      return nullptr;
+    return Parent.dyn_cast<PatternBindingDecl *>();
   }
   void setParentPatternBinding(PatternBindingDecl *PBD) {
-    ParentPattern = PBD;
+    assert(PBD);
+    Parent = PBD;
   }
-  
+
   /// Return the Pattern involved in initializing this VarDecl.  However, recall
   /// that the Pattern may be involved in initializing more than just this one
   /// vardecl.  For example, if this is a VarDecl for "x", the pattern may be
@@ -4636,15 +4698,52 @@ public:
   /// returns null.
   ///
   Pattern *getParentPattern() const;
-  
+
   /// Return the statement that owns the pattern associated with this VarDecl,
   /// if one exists.
+  ///
+  /// NOTE: After parsing and before type checking, all VarDecls from
+  /// CaseLabelItem's Patterns return their CaseStmt. After type checking, we
+  /// will have constructed the CaseLabelItem VarDecl linked list implying this
+  /// will return nullptr. After type checking, if one wishes to find a parent
+  /// pattern of a VarDecl of a CaseStmt, \see getRecursiveParentPatternStmt
+  /// instead.
   Stmt *getParentPatternStmt() const {
-    return ParentPattern.dyn_cast<Stmt*>();
+    if (!Parent)
+      return nullptr;
+    return Parent.dyn_cast<Stmt *>();
   }
-  void setParentPatternStmt(Stmt *S) {
-    ParentPattern = S;
+
+  void setParentPatternStmt(Stmt *s) {
+    assert(s);
+    Parent = s;
   }
+
+  /// Look for the parent pattern stmt of this var decl, recursively
+  /// looking through var decl pointers and then through any
+  /// fallthroughts.
+  Stmt *getRecursiveParentPatternStmt() const;
+
+  /// Returns the var decl that this var decl is an implicit reference to if
+  /// such a var decl exists.
+  VarDecl *getParentVarDecl() const {
+    if (!Parent)
+      return nullptr;
+    return Parent.dyn_cast<VarDecl *>();
+  }
+
+  /// Set \p v to be the pattern produced VarDecl that is the parent of this
+  /// var decl.
+  void setParentVarDecl(VarDecl *v) {
+    assert(v && v != this);
+    Parent = v;
+  }
+
+  /// If this is a VarDecl that does not belong to a CaseLabelItem's pattern,
+  /// return this. Otherwise, this VarDecl must belong to a CaseStmt's
+  /// CaseLabelItem. In that case, return the first case label item of the first
+  /// case stmt in a sequence of case stmts that fallthrough into each other.
+  VarDecl *getCanonicalVarDecl() const;
 
   /// True if the global stored property requires lazy initialization.
   bool isLazilyInitializedGlobal() const;
@@ -4827,7 +4926,7 @@ class ParamDecl : public VarDecl {
   SourceLoc SpecifierLoc;
 
   struct StoredDefaultArgument {
-    Expr *DefaultArg = nullptr;
+    PointerUnion<Expr *, VarDecl *> DefaultArg;
     Initializer *InitContext = nullptr;
     StringRef StringRepresentation;
   };
@@ -4884,11 +4983,19 @@ public:
   
   Expr *getDefaultValue() const {
     if (auto stored = DefaultValueAndFlags.getPointer())
-      return stored->DefaultArg;
+      return stored->DefaultArg.dyn_cast<Expr *>();
+    return nullptr;
+  }
+
+  VarDecl *getStoredProperty() const {
+    if (auto stored = DefaultValueAndFlags.getPointer())
+      return stored->DefaultArg.dyn_cast<VarDecl *>();
     return nullptr;
   }
 
   void setDefaultValue(Expr *E);
+
+  void setStoredProperty(VarDecl *var);
 
   Initializer *getDefaultArgumentInitContext() const {
     if (auto stored = DefaultValueAndFlags.getPointer())
@@ -5482,12 +5589,14 @@ public:
 
 class OperatorDecl;
 
-/// Note: These align with '%select's in diagnostics.
 enum class SelfAccessKind : uint8_t {
-  NonMutating = 0,
-  Mutating    = 1,
-  __Consuming = 2,
+  NonMutating,
+  Mutating,
+  __Consuming,
 };
+
+/// Diagnostic printing of \c SelfAccessKind.
+llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SelfAccessKind SAK);
   
 /// FuncDecl - 'func' declaration.
 class FuncDecl : public AbstractFunctionDecl {
@@ -5692,12 +5801,12 @@ class AccessorDecl final : public FuncDecl {
                AccessorKind accessorKind, AbstractStorageDecl *storage,
                SourceLoc staticLoc, StaticSpellingKind staticSpelling,
                bool throws, SourceLoc throwsLoc,
-               unsigned numParameterLists, GenericParamList *genericParams,
+               bool hasImplicitSelfDecl, GenericParamList *genericParams,
                DeclContext *parent)
     : FuncDecl(DeclKind::Accessor,
                staticLoc, staticSpelling, /*func loc*/ declLoc,
                /*name*/ Identifier(), /*name loc*/ declLoc,
-               throws, throwsLoc, numParameterLists, genericParams, parent),
+               throws, throwsLoc, hasImplicitSelfDecl, genericParams, parent),
       AccessorKeywordLoc(accessorKeywordLoc),
       Storage(storage) {
     Bits.AccessorDecl.AccessorKind = unsigned(accessorKind);
@@ -5871,7 +5980,7 @@ public:
 /// enum. EnumElementDecls are represented in the AST as members of their
 /// parent EnumDecl, although syntactically they are subordinate to the
 /// EnumCaseDecl.
-class EnumElementDecl : public ValueDecl {
+class EnumElementDecl : public DeclContext, public ValueDecl {
   /// This is the type specified with the enum element, for
   /// example 'Int' in 'case Y(Int)'.  This is null if there is no type
   /// associated with this element, as in 'case Z' or in all elements of enum
@@ -5891,7 +6000,8 @@ public:
                   SourceLoc EqualsLoc,
                   LiteralExpr *RawValueExpr,
                   DeclContext *DC)
-  : ValueDecl(DeclKind::EnumElement, DC, Name, IdentifierLoc),
+  : DeclContext(DeclContextKind::EnumElementDecl, DC),
+    ValueDecl(DeclKind::EnumElement, DC, Name, IdentifierLoc),
     Params(Params),
     EqualsLoc(EqualsLoc),
     RawValueExpr(RawValueExpr)
@@ -5959,14 +6069,23 @@ public:
     return getParameterList() != nullptr;
   }
 
-  static bool classof(const Decl *D) {
-    return D->getKind() == DeclKind::EnumElement;
-  }
-
   /// True if the case is marked 'indirect'.
   bool isIndirect() const {
     return getAttrs().hasAttribute<IndirectAttr>();
   }
+
+  static bool classof(const Decl *D) {
+    return D->getKind() == DeclKind::EnumElement;
+  }
+
+  static bool classof(const DeclContext *DC) {
+    if (auto D = DC->getAsDecl())
+      return classof(D);
+    return false;
+  }
+
+  using DeclContext::operator new;
+  using Decl::getASTContext;
 };
   
 inline SourceRange EnumCaseDecl::getSourceRange() const {

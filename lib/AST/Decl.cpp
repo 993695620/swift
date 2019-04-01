@@ -324,6 +324,16 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
   return OS << "'" << keywordOf(RO) << "'";
 }
 
+llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
+                                     SelfAccessKind SAK) {
+  switch (SAK) {
+  case SelfAccessKind::NonMutating: return OS << "'nonmutating'";
+  case SelfAccessKind::Mutating: return OS << "'mutating'";
+  case SelfAccessKind::__Consuming: return OS << "'__consuming'";
+  }
+  llvm_unreachable("Unknown SelfAccessKind");
+}
+
 DeclContext *Decl::getInnermostDeclContext() const {
   if (auto func = dyn_cast<AbstractFunctionDecl>(this))
     return const_cast<AbstractFunctionDecl*>(func);
@@ -520,8 +530,10 @@ bool Decl::isPrivateStdlibDecl(bool treatNonBuiltinProtocolsAsPublic) const {
   }
 
   if (auto ImportD = dyn_cast<ImportDecl>(D)) {
-    if (ImportD->getModule()->isSwiftShimsModule())
-      return true;
+    if (auto *Mod = ImportD->getModule()) {
+      if (Mod->isSwiftShimsModule())
+        return true;
+    }
   }
 
   auto VD = dyn_cast<ValueDecl>(D);
@@ -536,7 +548,8 @@ bool Decl::isPrivateStdlibDecl(bool treatNonBuiltinProtocolsAsPublic) const {
   return false;
 }
 
-bool Decl::isWeakImported(ModuleDecl *fromModule) const {
+bool Decl::isWeakImported(ModuleDecl *fromModule,
+                          AvailabilityContext fromContext) const {
   // For a Clang declaration, trust Clang.
   if (auto clangDecl = getClangDecl()) {
     return clangDecl->isWeakImported();
@@ -546,22 +559,28 @@ bool Decl::isWeakImported(ModuleDecl *fromModule) const {
   if (containingModule == fromModule)
     return false;
 
+  auto containingContext =
+      AvailabilityInference::availableRange(this,
+                                            containingModule->getASTContext());
+  if (!fromContext.isContainedIn(containingContext))
+    return true;
+
   if (getAttrs().hasAttribute<WeakLinkedAttr>())
     return true;
 
   if (auto *accessor = dyn_cast<AccessorDecl>(this))
-    return accessor->getStorage()->isWeakImported(fromModule);
+    return accessor->getStorage()->isWeakImported(fromModule, fromContext);
 
   if (auto *dtor = dyn_cast<DestructorDecl>(this))
-    return cast<ClassDecl>(dtor->getDeclContext())->isWeakImported(fromModule);
+    return cast<ClassDecl>(dtor->getDeclContext())->isWeakImported(
+        fromModule, fromContext);
 
   auto *dc = getDeclContext();
   if (auto *ext = dyn_cast<ExtensionDecl>(dc))
-    return ext->isWeakImported(fromModule);
+    return ext->isWeakImported(fromModule, fromContext);
   if (auto *ntd = dyn_cast<NominalTypeDecl>(dc))
-    return ntd->isWeakImported(fromModule);
+    return ntd->isWeakImported(fromModule, fromContext);
 
-  // FIXME: Also check availability when containingModule is resilient.
   return false;
 }
 
@@ -745,13 +764,8 @@ GenericSignature *GenericContext::getGenericSignature() const {
 
   // The signature of a Protocol is trivial (Self: TheProtocol) so let's compute
   // it.
-  if (auto PD = dyn_cast<ProtocolDecl>(this)) {
-    const_cast<ProtocolDecl *>(PD)->createGenericParamsIfMissing();
-    auto self = PD->getSelfInterfaceType()->castTo<GenericTypeParamType>();
-    auto req =
-        Requirement(RequirementKind::Conformance, self, PD->getDeclaredType());
-    return GenericSignature::get({self}, {req});
-  }
+  if (auto PD = dyn_cast<ProtocolDecl>(this))
+    return getGenericEnvironment()->getGenericSignature();
 
   return nullptr;
 }
@@ -764,6 +778,21 @@ GenericEnvironment *GenericContext::getGenericEnvironment() const {
   // If we only have a generic signature, build the generic environment.
   if (GenericSigOrEnv.dyn_cast<GenericSignature *>())
     return getLazyGenericEnvironmentSlow();
+
+  // The signature of a Protocol is trivial (Self: TheProtocol) so let's compute
+  // it.
+  if (auto PD = dyn_cast<ProtocolDecl>(this)) {
+    const_cast<ProtocolDecl *>(PD)->createGenericParamsIfMissing();
+    auto self = PD->getSelfInterfaceType()->castTo<GenericTypeParamType>();
+    auto req =
+        Requirement(RequirementKind::Conformance, self, PD->getDeclaredType());
+    auto *genericSig = GenericSignature::get({self}, {req});
+
+    // Save it for next time.
+    const_cast<GenericContext *>(this)
+      ->setGenericEnvironment(genericSig->createGenericEnvironment());
+    return getGenericEnvironment();
+  }
 
   return nullptr;
 }
@@ -1898,14 +1927,7 @@ bool AbstractStorageDecl::isResilient() const {
   if (!isFormallyResilient())
     return false;
 
-  switch (getDeclContext()->getParentModule()->getResilienceStrategy()) {
-  case ResilienceStrategy::Resilient:
-    return true;
-  case ResilienceStrategy::Default:
-    return false;
-  }
-
-  llvm_unreachable("Unhandled ResilienceStrategy in switch.");
+  return getModuleContext()->isResilient();
 }
 
 bool AbstractStorageDecl::isResilient(ModuleDecl *M,
@@ -2073,6 +2095,32 @@ bool swift::conflicting(ASTContext &ctx,
   if (!conflicting(sig1, sig2, skipProtocolExtensionCheck))
     return false;
 
+  // Functions and enum elements do not conflict with each other if their types
+  // are different.
+  if (((sig1.IsFunction && sig2.IsEnumElement) ||
+       (sig1.IsEnumElement && sig2.IsFunction)) &&
+      sig1Type != sig2Type) {
+    return false;
+  }
+
+  // Nominal types and enum elements always conflict with each other.
+  if ((sig1.IsNominal && sig2.IsEnumElement) ||
+      (sig1.IsEnumElement && sig2.IsNominal)) {
+    return true;
+  }
+
+  // Typealiases and enum elements always conflict with each other.
+  if ((sig1.IsTypeAlias && sig2.IsEnumElement) ||
+      (sig1.IsEnumElement && sig2.IsTypeAlias)) {
+    return true;
+  }
+
+  // Enum elements always conflict with each other. At this point, they
+  // have the same base name but different types.
+  if (sig1.IsEnumElement && sig2.IsEnumElement) {
+    return true;
+  }
+
   // Functions always conflict with non-functions with the same signature.
   // In practice, this only applies for zero argument functions.
   if (sig1.IsFunction != sig2.IsFunction)
@@ -2178,6 +2226,10 @@ static Type mapSignatureFunctionType(ASTContext &ctx, Type type,
                                      bool isMethod,
                                      bool isInitializer,
                                      unsigned curryLevels) {
+  if (type->hasError()) {
+    return type;
+  }
+
   if (curryLevels == 0) {
     // In an initializer, ignore optionality.
     if (isInitializer) {
@@ -2231,6 +2283,9 @@ OverloadSignature ValueDecl::getOverloadSignature() const {
   signature.IsInstanceMember = isInstanceMember();
   signature.IsVariable = isa<VarDecl>(this);
   signature.IsFunction = isa<AbstractFunctionDecl>(this);
+  signature.IsEnumElement = isa<EnumElementDecl>(this);
+  signature.IsNominal = isa<NominalTypeDecl>(this);
+  signature.IsTypeAlias = isa<TypeAliasDecl>(this);
 
   // Unary operators also include prefix/postfix.
   if (auto func = dyn_cast<FuncDecl>(this)) {
@@ -2265,7 +2320,12 @@ CanType ValueDecl::getOverloadSignatureType() const {
     if (isa<VarDecl>(this)) {
       defaultSignatureType = TupleType::getEmpty(getASTContext());
     } else {
-      defaultSignatureType = getInterfaceType()->getCanonicalType();
+      defaultSignatureType = mapSignatureFunctionType(
+          getASTContext(), getInterfaceType(),
+          /*topLevelFunction=*/true,
+          /*isMethod=*/false,
+          /*isInitializer=*/false,
+          1)->getCanonicalType();
     }
 
     // We want to curry the default signature type with the 'self' type of the
@@ -2274,6 +2334,13 @@ CanType ValueDecl::getOverloadSignatureType() const {
     // and struct decl.
     return defaultSignatureType->addCurriedSelfType(getDeclContext())
                                ->getCanonicalType();
+  }
+
+  if (isa<EnumElementDecl>(this)) {
+    auto mappedType = mapSignatureFunctionType(
+        getASTContext(), getInterfaceType(), /*topLevelFunction=*/false,
+        /*isMethod=*/false, /*isInitializer=*/false, /*curryLevels=*/0);
+    return mappedType->getCanonicalType();
   }
 
   // Note: If you add more cases to this function, you should update the
@@ -2396,14 +2463,9 @@ void ValueDecl::setInterfaceType(Type type) {
     assert(!type->hasTypeVariable() && "Type variable in interface type");
     assert(!type->is<InOutType>() && "Interface type must be materializable");
 
-    // lldb creates global typealiases with archetypes in them.
-    // FIXME: Add an isDebugAlias() flag, like isDebugVar().
-    //
-    // Also, ParamDecls in closure contexts can have type variables
+    // ParamDecls in closure contexts can have type variables
     // archetype in them during constraint generation.
-    if (!isa<TypeAliasDecl>(this) &&
-        !(isa<ParamDecl>(this) &&
-          isa<AbstractClosureExpr>(getDeclContext()))) {
+    if (!(isa<ParamDecl>(this) && isa<AbstractClosureExpr>(getDeclContext()))) {
       assert(!type->hasArchetype() &&
              "Archetype in interface type");
     }
@@ -2513,12 +2575,14 @@ bool ValueDecl::isUsableFromInline() const {
   assert(getFormalAccess() == AccessLevel::Internal);
 
   if (getAttrs().hasAttribute<UsableFromInlineAttr>() ||
+      getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>() ||
       getAttrs().hasAttribute<InlinableAttr>())
     return true;
 
   if (auto *accessor = dyn_cast<AccessorDecl>(this)) {
     auto *storage = accessor->getStorage();
     if (storage->getAttrs().hasAttribute<UsableFromInlineAttr>() ||
+        storage->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>() ||
         storage->getAttrs().hasAttribute<InlinableAttr>())
       return true;
   }
@@ -2540,9 +2604,35 @@ bool ValueDecl::isUsableFromInline() const {
   return false;
 }
 
-/// Return the access level of an internal or public declaration
-/// that's been testably imported.
-static AccessLevel getTestableOrPrivateImportsAccess(const ValueDecl *decl) {
+bool ValueDecl::shouldHideFromEditor() const {
+  // Hide private stdlib declarations.
+  if (isPrivateStdlibDecl(/*treatNonBuiltinProtocolsAsPublic*/ false) ||
+      // ShowInInterfaceAttr is for decls to show in interface as exception but
+      // they are not intended to be used directly.
+      getAttrs().hasAttribute<ShowInInterfaceAttr>())
+    return true;
+
+  if (AvailableAttr::isUnavailable(this))
+    return true;
+
+  if (auto *ClangD = getClangDecl()) {
+    if (ClangD->hasAttr<clang::SwiftPrivateAttr>())
+      return true;
+  }
+
+  if (!isUserAccessible())
+    return true;
+
+  // Hide editor placeholders.
+  if (getBaseName().isEditorPlaceholder())
+    return true;
+
+  return false;
+}
+
+/// Return maximally open access level which could be associated with the
+/// given declaration accounting for @testable importers.
+static AccessLevel getMaximallyOpenAccessFor(const ValueDecl *decl) {
   // Non-final classes are considered open to @testable importers.
   if (auto cls = dyn_cast<ClassDecl>(decl)) {
     if (!cls->isFinal())
@@ -2568,6 +2658,11 @@ static AccessLevel getAdjustedFormalAccess(const ValueDecl *VD,
                                            AccessLevel access,
                                            const DeclContext *useDC,
                                            bool treatUsableFromInlineAsPublic) {
+  // If access control is disabled in the current context, adjust
+  // access level of the current declaration to be as open as possible.
+  if (useDC && VD->getASTContext().isAccessControlDisabled())
+    return getMaximallyOpenAccessFor(VD);
+
   if (treatUsableFromInlineAsPublic &&
       access == AccessLevel::Internal &&
       VD->isUsableFromInline()) {
@@ -2580,7 +2675,7 @@ static AccessLevel getAdjustedFormalAccess(const ValueDecl *VD,
     auto *useSF = dyn_cast<SourceFile>(useDC->getModuleScopeContext());
     if (!useSF) return access;
     if (useSF->hasTestableOrPrivateImport(access, VD))
-      return getTestableOrPrivateImportsAccess(VD);
+      return getMaximallyOpenAccessFor(VD);
   }
 
   return access;
@@ -2608,16 +2703,16 @@ AccessLevel ValueDecl::getEffectiveAccess() const {
   case AccessLevel::Internal:
     if (getModuleContext()->isTestingEnabled() ||
         getModuleContext()->arePrivateImportsEnabled())
-      effectiveAccess = getTestableOrPrivateImportsAccess(this);
+      effectiveAccess = getMaximallyOpenAccessFor(this);
     break;
   case AccessLevel::FilePrivate:
     if (getModuleContext()->arePrivateImportsEnabled())
-      effectiveAccess = getTestableOrPrivateImportsAccess(this);
+      effectiveAccess = getMaximallyOpenAccessFor(this);
     break;
   case AccessLevel::Private:
     effectiveAccess = AccessLevel::FilePrivate;
     if (getModuleContext()->arePrivateImportsEnabled())
-      effectiveAccess = getTestableOrPrivateImportsAccess(this);
+      effectiveAccess = getMaximallyOpenAccessFor(this);
     break;
   }
 
@@ -2750,6 +2845,9 @@ ValueDecl::getFormalAccessScope(const DeclContext *useDC,
 static bool checkAccessUsingAccessScopes(const DeclContext *useDC,
                                          const ValueDecl *VD,
                                          AccessLevel access) {
+  if (VD->getASTContext().isAccessControlDisabled())
+    return true;
+
   AccessScope accessScope =
       getAccessScopeForFormalAccess(VD, access, useDC,
                                     /*treatUsableFromInlineAsPublic*/false);
@@ -2768,8 +2866,20 @@ static bool checkAccessUsingAccessScopes(const DeclContext *useDC,
 ///
 /// See ValueDecl::isAccessibleFrom for a description of \p forConformance.
 static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
-                        AccessLevel access, bool forConformance) {
+                        bool forConformance,
+                        llvm::function_ref<AccessLevel()> getAccessLevel) {
+  if (VD->getASTContext().isAccessControlDisabled())
+    return true;
+
+  auto access = getAccessLevel();
   auto *sourceDC = VD->getDeclContext();
+
+  // Preserve "fast path" behavior for everything inside
+  // protocol extensions and operators, otherwise allow access
+  // check declarations inside inaccessible members via slower
+  // access scope based check, which is helpful for diagnostics.
+  if (!(sourceDC->getSelfProtocolDecl() || VD->isOperator()))
+    return checkAccessUsingAccessScopes(useDC, VD, access);
 
   if (!forConformance) {
     if (auto *proto = sourceDC->getSelfProtocolDecl()) {
@@ -2805,9 +2915,7 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
   case AccessLevel::FilePrivate:
     if (useDC->getModuleScopeContext() != sourceDC->getModuleScopeContext()) {
       auto *useSF = dyn_cast<SourceFile>(useDC->getModuleScopeContext());
-      if (useSF && useSF->hasTestableOrPrivateImport(access, VD))
-        return true;
-      return false;
+      return useSF && useSF->hasTestableOrPrivateImport(access, VD);
     }
     return true;
   case AccessLevel::Internal: {
@@ -2816,10 +2924,7 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
     if (useFile->getParentModule() == sourceModule)
       return true;
     auto *useSF = dyn_cast<SourceFile>(useFile);
-    if (!useSF) return false;
-    if (useSF->hasTestableOrPrivateImport(access, sourceModule))
-      return true;
-    return false;
+    return useSF && useSF->hasTestableOrPrivateImport(access, sourceModule);
   }
   case AccessLevel::Public:
   case AccessLevel::Open:
@@ -2830,21 +2935,8 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
 
 bool ValueDecl::isAccessibleFrom(const DeclContext *useDC,
                                  bool forConformance) const {
-  auto access = getFormalAccess();
-  bool result = checkAccess(useDC, this, access, forConformance);
-
-  // For everything outside of protocols and operators, we should get the same
-  // result using either implementation of checkAccess, because useDC must
-  // already have access to this declaration's DeclContext.
-  // FIXME: Arguably, we're doing the wrong thing for operators here too,
-  // because we're finding internal operators within private types. Fortunately
-  // we have a requirement that a member operator take the enclosing type as an
-  // argument, so it won't ever match.
-  assert(getDeclContext()->getSelfProtocolDecl() ||
-         isOperator() ||
-         result == checkAccessUsingAccessScopes(useDC, this, access));
-
-  return result;
+  return checkAccess(useDC, this, forConformance,
+                     [&]() { return getFormalAccess(); });
 }
 
 bool AbstractStorageDecl::isSetterAccessibleFrom(const DeclContext *DC,
@@ -2860,8 +2952,8 @@ bool AbstractStorageDecl::isSetterAccessibleFrom(const DeclContext *DC,
   if (isa<ParamDecl>(this))
     return true;
 
-  auto access = getSetterFormalAccess();
-  return checkAccess(DC, this, access, forConformance);
+  return checkAccess(DC, this, forConformance,
+                     [&]() { return getSetterFormalAccess(); });
 }
 
 void ValueDecl::copyFormalAccessFrom(const ValueDecl *source,
@@ -2987,20 +3079,10 @@ bool NominalTypeDecl::isFormallyResilient() const {
 }
 
 bool NominalTypeDecl::isResilient() const {
-  // If we're not formally resilient, don't check the module resilience
-  // strategy.
   if (!isFormallyResilient())
     return false;
 
-  // Otherwise, check the module.
-  switch (getParentModule()->getResilienceStrategy()) {
-  case ResilienceStrategy::Resilient:
-    return true;
-  case ResilienceStrategy::Default:
-    return false;
-  }
-
-  llvm_unreachable("Unhandled ResilienceStrategy in switch.");
+  return getModuleContext()->isResilient();
 }
 
 bool NominalTypeDecl::isResilient(ModuleDecl *M,
@@ -3235,7 +3317,7 @@ void TypeAliasDecl::setUnderlyingType(Type underlying) {
     auto parentDC = getDeclContext();
     if (parentDC->isTypeContext())
       parent = parentDC->getDeclaredInterfaceType();
-    auto sugaredType = NameAliasType::get(this, parent, subs, underlying);
+    auto sugaredType = TypeAliasType::get(this, parent, subs, underlying);
     setInterfaceType(MetatypeType::get(sugaredType, ctx));
   }
 }
@@ -3339,9 +3421,11 @@ TypeLoc &AssociatedTypeDecl::getDefaultDefinitionLoc() {
 
 SourceRange AssociatedTypeDecl::getSourceRange() const {
   SourceLoc endLoc;
-  if (auto TWC = getTrailingWhereClause())
+  if (auto TWC = getTrailingWhereClause()) {
     endLoc = TWC->getSourceRange().End;
-  else if (!getInherited().empty()) {
+  } else if (getDefaultDefinitionLoc().hasLocation()) {
+    endLoc = getDefaultDefinitionLoc().getSourceRange().End;
+  } else if (!getInherited().empty()) {
     endLoc = getInherited().back().getSourceRange().End;
   } else {
     endLoc = getNameLoc();
@@ -3444,9 +3528,8 @@ ClassDecl::ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
   Bits.ClassDecl.InheritsSuperclassInits = 0;
   Bits.ClassDecl.RawForeignKind = 0;
   Bits.ClassDecl.HasDestructorDecl = 0;
-  Bits.ClassDecl.ObjCKind = 0;
-  Bits.ClassDecl.HasObjCMembersComputed = 0;
-  Bits.ClassDecl.HasObjCMembers = 0;
+  Bits.ClassDecl.Ancestry = 0;
+  Bits.ClassDecl.AncestryComputed = 0;
   Bits.ClassDecl.HasMissingDesignatedInitializers = 0;
   Bits.ClassDecl.HasMissingVTableEntries = 0;
 }
@@ -3457,8 +3540,7 @@ bool ClassDecl::hasResilientMetadata() const {
     return false;
 
   // If the module is not resilient, neither is the class metadata.
-  if (getParentModule()->getResilienceStrategy()
-          != ResilienceStrategy::Resilient)
+  if (!getModuleContext()->isResilient())
     return false;
 
   // If the class is not public, we can't use it outside the module at all.
@@ -3501,7 +3583,6 @@ void ClassDecl::addImplicitDestructor() {
   // Create an empty body for the destructor.
   DD->setBody(BraceStmt::create(ctx, getLoc(), { }, getLoc(), true));
   addMember(DD);
-  setHasDestructor();
 
   // Propagate access control and versioned-ness.
   DD->copyFormalAccessFrom(this, /*sourceIsParentContext*/true);
@@ -3561,16 +3642,18 @@ bool ClassDecl::inheritsSuperclassInitializers(LazyResolver *resolver) {
   return Bits.ClassDecl.InheritsSuperclassInits;
 }
 
-ObjCClassKind ClassDecl::checkObjCAncestry() const {
+AncestryOptions ClassDecl::checkAncestry() const {
   // See if we've already computed this.
-  if (Bits.ClassDecl.ObjCKind)
-    return ObjCClassKind(Bits.ClassDecl.ObjCKind - 1);
+  if (Bits.ClassDecl.AncestryComputed)
+    return AncestryOptions(Bits.ClassDecl.Ancestry);
 
   llvm::SmallPtrSet<const ClassDecl *, 8> visited;
-  bool genericAncestry = false, isObjC = false;
-  const ClassDecl *CD = this;
 
-  for (;;) {
+  AncestryOptions result;
+  const ClassDecl *CD = this;
+  auto *M = getParentModule();
+
+  do {
     // If we hit circularity, we will diagnose at some point in typeCheckDecl().
     // However we have to explicitly guard against that here because we get
     // called as part of validateDecl().
@@ -3578,55 +3661,54 @@ ObjCClassKind ClassDecl::checkObjCAncestry() const {
       break;
 
     if (CD->isGenericContext())
-      genericAncestry = true;
+      result |= AncestryFlags::Generic;
 
-    // Is this class @objc? For the current class, only look at the attribute
-    // to avoid cycles; for superclasses, compute @objc completely.
-    if ((CD == this && CD->getAttrs().hasAttribute<ObjCAttr>()) ||
-        (CD != this && CD->isObjC()))
-      isObjC = true;
+    // Note: it's OK to check for @objc explicitly instead of calling isObjC()
+    // to infer it since we're going to visit every superclass.
+    if (CD->getAttrs().hasAttribute<ObjCAttr>())
+      result |= AncestryFlags::ObjC;
 
-    if (!CD->hasSuperclass())
-      break;
+    if (CD->getAttrs().hasAttribute<ObjCMembersAttr>())
+      result |= AncestryFlags::ObjCMembers;
+
+    if (CD->hasClangNode())
+      result |= AncestryFlags::ClangImported;
+
+    if (CD->hasResilientMetadata())
+      result |= AncestryFlags::Resilient;
+
+    if (CD->hasResilientMetadata(M, ResilienceExpansion::Maximal))
+      result |= AncestryFlags::ResilientOther;
+
     CD = CD->getSuperclassDecl();
-    // If we don't have a valid class here, we should have diagnosed
-    // elsewhere.
-    if (!CD)
-      break;
-  }
-
-  ObjCClassKind kind = ObjCClassKind::ObjC;
-  if (!isObjC)
-    kind = ObjCClassKind::NonObjC;
-  else if (genericAncestry)
-    kind = ObjCClassKind::ObjCMembers;
-  else if (CD == this || !CD->isObjC())
-    kind = ObjCClassKind::ObjCWithSwiftRoot;
+  } while (CD != nullptr);
 
   // Save the result for later.
-  const_cast<ClassDecl *>(this)->Bits.ClassDecl.ObjCKind
-    = unsigned(kind) + 1;
-  return kind;
+  const_cast<ClassDecl *>(this)->Bits.ClassDecl.Ancestry = result.toRaw();
+  const_cast<ClassDecl *>(this)->Bits.ClassDecl.AncestryComputed = 1;
+  return result;
 }
 
-bool ClassDecl::hasObjCMembersSlow() {
-  // Don't attempt to calculate this again.
-  Bits.ClassDecl.HasObjCMembersComputed = true;
+bool ClassDecl::isSuperclassOf(ClassDecl *other) const {
+  llvm::SmallPtrSet<const ClassDecl *, 8> visited;
 
-  bool result = false;
-  if (getAttrs().hasAttribute<ObjCMembersAttr>())
-    result = true;
-  else if (auto *superclassDecl = getSuperclassDecl())
-    result = superclassDecl->hasObjCMembers();
+  do {
+    if (!visited.insert(other).second)
+      break;
 
-  Bits.ClassDecl.HasObjCMembers = result;
-  return result;
+    if (this == other)
+      return true;
+
+    other = other->getSuperclassDecl();
+  } while (other != nullptr);
+
+  return false;
 }
 
 ClassDecl::MetaclassKind ClassDecl::getMetaclassKind() const {
   assert(getASTContext().LangOpts.EnableObjCInterop &&
          "querying metaclass kind without objc interop");
-  auto objc = checkObjCAncestry() != ObjCClassKind::NonObjC;
+  auto objc = checkAncestry(AncestryFlags::ObjC);
   return objc ? MetaclassKind::ObjC : MetaclassKind::SwiftStub;
 }
 
@@ -3716,11 +3798,30 @@ ClassDecl::findImplementingMethod(const AbstractFunctionDecl *Method) const {
       }
     }
     // Check the superclass
-    if (!C->hasSuperclass())
-      break;
     C = C->getSuperclassDecl();
   }
   return nullptr;
+}
+
+bool ClassDecl::walkSuperclasses(
+    llvm::function_ref<TypeWalker::Action(ClassDecl *)> fn) const {
+
+  SmallPtrSet<ClassDecl *, 8> seen;
+  auto *cls = const_cast<ClassDecl *>(this);
+
+  while (cls && seen.insert(cls).second) {
+    switch (fn(cls)) {
+    case TypeWalker::Action::Stop:
+      return true;
+    case TypeWalker::Action::SkipChildren:
+      return false;
+    case TypeWalker::Action::Continue:
+      cls = cls->getSuperclassDecl();
+      continue;
+    }
+  }
+
+  return false;
 }
 
 EnumCaseDecl *EnumCaseDecl::create(SourceLoc CaseLoc,
@@ -3800,12 +3901,8 @@ bool EnumDecl::isFormallyExhaustive(const DeclContext *useDC) const {
 
   // Non-imported enums in non-resilient modules are exhaustive.
   const ModuleDecl *containingModule = getModuleContext();
-  switch (containingModule->getResilienceStrategy()) {
-  case ResilienceStrategy::Default:
+  if (!containingModule->isResilient())
     return true;
-  case ResilienceStrategy::Resilient:
-    break;
-  }
 
   // Non-public, non-versioned enums are always exhaustive.
   AccessScope accessScope = getFormalAccessScope(/*useDC*/nullptr,
@@ -3864,16 +3961,19 @@ ProtocolDecl::ProtocolDecl(DeclContext *DC, SourceLoc ProtocolLoc,
   Bits.ProtocolDecl.ExistentialConformsToSelf = false;
   Bits.ProtocolDecl.Circularity
     = static_cast<unsigned>(CircularityCheck::Unchecked);
+  Bits.ProtocolDecl.InheritedProtocolsValid = 0;
   Bits.ProtocolDecl.NumRequirementsInSignature = 0;
   Bits.ProtocolDecl.HasMissingRequirements = false;
   Bits.ProtocolDecl.KnownProtocol = 0;
-  setTrailingWhereClause(TrailingWhere);
+    setTrailingWhereClause(TrailingWhere);
 }
 
-llvm::TinyPtrVector<ProtocolDecl *>
-ProtocolDecl::getInheritedProtocols() const {
-  llvm::TinyPtrVector<ProtocolDecl *> result;
-  SmallPtrSet<const ProtocolDecl *, 4> known;
+ArrayRef<ProtocolDecl *>
+ProtocolDecl::getInheritedProtocolsSlow() {
+  Bits.ProtocolDecl.InheritedProtocolsValid = true;
+
+  llvm::SmallVector<ProtocolDecl *, 2> result;
+  SmallPtrSet<const ProtocolDecl *, 2> known;
   known.insert(this);
   bool anyObject = false;
   for (const auto found :
@@ -3885,7 +3985,9 @@ ProtocolDecl::getInheritedProtocols() const {
     }
   }
 
-  return result;
+  auto &ctx = getASTContext();
+  InheritedProtocols = ctx.AllocateCopy(result);
+  return InheritedProtocols;
 }
 
 llvm::TinyPtrVector<AssociatedTypeDecl *>
@@ -3927,7 +4029,10 @@ ClassDecl *ProtocolDecl::getSuperclassDecl() const {
 void ProtocolDecl::setSuperclass(Type superclass) {
   assert((!superclass || !superclass->hasArchetype())
          && "superclass must be interface type");
-  LazySemanticInfo.Superclass.setPointerAndInt(superclass, true);
+  LazySemanticInfo.SuperclassType.setPointerAndInt(superclass, true);
+  LazySemanticInfo.SuperclassDecl.setPointerAndInt(
+    superclass ? superclass->getClassOrBoundGenericClass() : nullptr,
+    true);
 }
 
 bool ProtocolDecl::walkInheritedProtocols(
@@ -4074,8 +4179,15 @@ findProtocolSelfReferences(const ProtocolDecl *proto, Type type,
   // the parameter type.
   if (auto funcTy = type->getAs<AnyFunctionType>()) {
     auto inputKind = SelfReferenceKind::None();
-    for (auto &elt : funcTy->getParams()) {
-      inputKind |= findProtocolSelfReferences(proto, elt.getOldType(),
+    for (auto param : funcTy->getParams()) {
+      // inout parameters are invariant.
+      if (param.isInOut()) {
+        if (findProtocolSelfReferences(proto, param.getPlainType(),
+                                       skipAssocTypes)) {
+          return SelfReferenceKind::Other();
+        }
+      }
+      inputKind |= findProtocolSelfReferences(proto, param.getParameterType(),
                                               skipAssocTypes);
     }
     auto resultKind = findProtocolSelfReferences(proto, funcTy->getResult(),
@@ -4104,14 +4216,6 @@ findProtocolSelfReferences(const ProtocolDecl *proto, Type type,
   if (auto selfType = type->getAs<DynamicSelfType>()) {
     return findProtocolSelfReferences(proto, selfType->getSelfType(),
                                       skipAssocTypes);
-  }
-
-  // InOut types are invariant.
-  if (auto inOutType = type->getAs<InOutType>()) {
-    if (findProtocolSelfReferences(proto, inOutType->getObjectType(),
-                                   skipAssocTypes)) {
-      return SelfReferenceKind::Other();
-    }
   }
 
   // Bound generic types are invariant.
@@ -4184,8 +4288,15 @@ ProtocolDecl::findProtocolSelfReferences(const ValueDecl *value,
     // as a function result type.
     if (!allowCovariantParameters) {
       auto inputKind = SelfReferenceKind::None();
-      for (auto &elt : type->castTo<AnyFunctionType>()->getParams()) {
-        inputKind |= ::findProtocolSelfReferences(this, elt.getOldType(),
+      for (auto param : type->castTo<AnyFunctionType>()->getParams()) {
+        // inout parameters are invariant.
+        if (param.isInOut()) {
+          if (::findProtocolSelfReferences(this, param.getPlainType(),
+                                           skipAssocTypes)) {
+            return SelfReferenceKind::Other();
+          }
+        }
+        inputKind |= ::findProtocolSelfReferences(this, param.getParameterType(),
                                                   skipAssocTypes);
       }
 
@@ -4333,9 +4444,43 @@ void ProtocolDecl::setRequirementSignature(ArrayRef<Requirement> requirements) {
   }
 }
 
+void ProtocolDecl::computeKnownProtocolKind() const {
+  auto module = getModuleContext();
+  if (module != module->getASTContext().getStdlibModule() &&
+      !module->getName().is("Foundation")) {
+    const_cast<ProtocolDecl *>(this)->Bits.ProtocolDecl.KnownProtocol = 1;
+    return;
+  }
+
+  unsigned value =
+    llvm::StringSwitch<unsigned>(getBaseName().userFacingName())
+#define PROTOCOL_WITH_NAME(Id, Name) \
+      .Case(Name, static_cast<unsigned>(KnownProtocolKind::Id) + 2)
+#include "swift/AST/KnownProtocols.def"
+      .Default(1);
+
+  const_cast<ProtocolDecl *>(this)->Bits.ProtocolDecl.KnownProtocol = value;
+}
+
 void AbstractStorageDecl::overwriteImplInfo(StorageImplInfo implInfo) {
   setFieldsFromImplInfo(implInfo);
   Accessors.getPointer()->overwriteImplInfo(implInfo);
+}
+
+bool AbstractStorageDecl::hasPrivateAccessor() const {
+  for (auto accessor : getAllAccessors()) {
+    if (hasPrivateOrFilePrivateFormalAccess(accessor))
+      return true;
+  }
+  return false;
+}
+
+bool AbstractStorageDecl::hasDidSetOrWillSetDynamicReplacement() const {
+  if (auto *func = getDidSetFunc())
+    return func->getAttrs().hasAttribute<DynamicReplacementAttr>();
+  if (auto *func = getWillSetFunc())
+    return func->getAttrs().hasAttribute<DynamicReplacementAttr>();
+  return false;
 }
 
 void AbstractStorageDecl::setAccessors(StorageImplInfo implInfo,
@@ -4785,12 +4930,90 @@ SourceRange VarDecl::getTypeSourceRangeForDiagnostics() const {
   return SourceRange();
 }
 
-static bool isVarInPattern(const VarDecl *VD, Pattern *P) {
+static bool isVarInPattern(const VarDecl *vd, Pattern *p) {
   bool foundIt = false;
-  P->forEachVariable([&](VarDecl *FoundFD) {
-    foundIt |= FoundFD == VD;
-  });
+  p->forEachVariable([&](VarDecl *foundFD) { foundIt |= foundFD == vd; });
   return foundIt;
+}
+
+static Optional<std::pair<CaseStmt *, Pattern *>>
+findParentPatternCaseStmtAndPattern(const VarDecl *inputVD) {
+  auto getMatchingPattern = [&](CaseStmt *cs) -> Pattern * {
+    // Check if inputVD is in our case body var decls if we have any. If we do,
+    // treat its pattern as our first case label item pattern.
+    for (auto *vd : cs->getCaseBodyVariablesOrEmptyArray()) {
+      if (vd == inputVD) {
+        return cs->getMutableCaseLabelItems().front().getPattern();
+      }
+    }
+
+    // Then check the rest of our case label items.
+    for (auto &item : cs->getMutableCaseLabelItems()) {
+      if (isVarInPattern(inputVD, item.getPattern())) {
+        return item.getPattern();
+      }
+    }
+
+    // Otherwise return false if we do not find anything.
+    return nullptr;
+  };
+
+  // First find our canonical var decl. This is the VarDecl corresponding to the
+  // first case label item of the first case block in the fallthrough chain that
+  // our case block is within. Grab the case stmt associated with that var decl
+  // and start traveling down the fallthrough chain looking for the case
+  // statement that the input VD belongs to by using getMatchingPattern().
+  auto *canonicalVD = inputVD->getCanonicalVarDecl();
+  auto *caseStmt =
+      dyn_cast_or_null<CaseStmt>(canonicalVD->getParentPatternStmt());
+  if (!caseStmt)
+    return None;
+
+  if (auto *p = getMatchingPattern(caseStmt))
+    return std::make_pair(caseStmt, p);
+
+  while ((caseStmt = caseStmt->getFallthroughDest().getPtrOrNull())) {
+    if (auto *p = getMatchingPattern(caseStmt))
+      return std::make_pair(caseStmt, p);
+  }
+
+  return None;
+}
+
+VarDecl *VarDecl::getCanonicalVarDecl() const {
+  // Any var decl without a parent var decl is canonical. This means that before
+  // type checking, all var decls are canonical.
+  auto *cur = const_cast<VarDecl *>(this);
+  auto *vd = cur->getParentVarDecl();
+  if (!vd)
+    return cur;
+
+#ifndef NDEBUG
+  // Make sure that we don't get into an infinite loop.
+  SmallPtrSet<VarDecl *, 8> visitedDecls;
+  visitedDecls.insert(vd);
+  visitedDecls.insert(cur);
+#endif
+  while (vd) {
+    cur = vd;
+    vd = vd->getParentVarDecl();
+    assert((!vd || visitedDecls.insert(vd).second) && "Infinite loop ?!");
+  }
+
+  return cur;
+}
+
+Stmt *VarDecl::getRecursiveParentPatternStmt() const {
+  // If our parent is already a pattern stmt, just return that.
+  if (auto *stmt = getParentPatternStmt())
+    return stmt;
+
+  // Otherwise, see if we have a parent var decl. If we do not, then return
+  // nullptr. Otherwise, return the case stmt that we found.
+  auto result = findParentPatternCaseStmtAndPattern(this);
+  if (!result.hasValue())
+    return nullptr;
+  return result->first;
 }
 
 /// Return the Pattern involved in initializing this VarDecl.  Recall that the
@@ -4814,7 +5037,7 @@ Pattern *VarDecl::getParentPattern() const {
     
     if (auto *CS = dyn_cast<CatchStmt>(stmt))
       return CS->getErrorPattern();
-    
+
     if (auto *cs = dyn_cast<CaseStmt>(stmt)) {
       // In a case statement, search for the pattern that contains it.  This is
       // a bit silly, because you can't have something like "case x, y:" anyway.
@@ -4822,17 +5045,27 @@ Pattern *VarDecl::getParentPattern() const {
         if (isVarInPattern(this, items.getPattern()))
           return items.getPattern();
       }
-    } else if (auto *LCS = dyn_cast<LabeledConditionalStmt>(stmt)) {
+    }
+
+    if (auto *LCS = dyn_cast<LabeledConditionalStmt>(stmt)) {
       for (auto &elt : LCS->getCond())
         if (auto pat = elt.getPatternOrNull())
           if (isVarInPattern(this, pat))
             return pat;
     }
-    
+
     //stmt->dump();
     assert(0 && "Unknown parent pattern statement?");
   }
-  
+
+  // Otherwise, check if we have to walk our case stmt's var decl list to find
+  // the pattern.
+  if (auto caseStmtPatternPair = findParentPatternCaseStmtAndPattern(this)) {
+    return caseStmtPatternPair->second;
+  }
+
+  // Otherwise, this is a case we do not know or understand. Return nullptr to
+  // signal we do not have any information.
   return nullptr;
 }
 
@@ -5084,6 +5317,17 @@ void ParamDecl::setDefaultValue(Expr *E) {
   DefaultValueAndFlags.getPointer()->DefaultArg = E;
 }
 
+void ParamDecl::setStoredProperty(VarDecl *var) {
+  if (!DefaultValueAndFlags.getPointer()) {
+    if (!var) return;
+
+    DefaultValueAndFlags.setPointer(
+      getASTContext().Allocate<StoredDefaultArgument>());
+  }
+
+  DefaultValueAndFlags.getPointer()->DefaultArg = var;
+}
+
 void ParamDecl::setDefaultArgumentInitContext(Initializer *initContext) {
   assert(DefaultValueAndFlags.getPointer());
   DefaultValueAndFlags.getPointer()->InitContext = initContext;
@@ -5101,7 +5345,26 @@ ParamDecl::getDefaultValueStringRepresentation(
     auto existing = DefaultValueAndFlags.getPointer()->StringRepresentation;
     if (!existing.empty())
       return existing;
+
+    if (!getDefaultValue()) {
+      // TypeChecker::checkDefaultArguments() nulls out the default value
+      // if it fails to type check it. This only seems to happen with an
+      // invalid/incomplete parameter list that contains a parameter with an
+      // unresolved default value.
+      return "<<empty>>";
+    }
     return extractInlinableText(getASTContext().SourceMgr, getDefaultValue(),
+                                scratch);
+  }
+  case DefaultArgumentKind::StoredProperty: {
+    assert(DefaultValueAndFlags.getPointer() &&
+           "default value not provided yet");
+    auto existing = DefaultValueAndFlags.getPointer()->StringRepresentation;
+    if (!existing.empty())
+      return existing;
+    auto var = getStoredProperty();
+    return extractInlinableText(getASTContext().SourceMgr,
+                                var->getParentInitializer(),
                                 scratch);
   }
   case DefaultArgumentKind::Inherited:
@@ -5122,7 +5385,8 @@ ParamDecl::getDefaultValueStringRepresentation(
 
 void
 ParamDecl::setDefaultValueStringRepresentation(StringRef stringRepresentation) {
-  assert(getDefaultArgumentKind() == DefaultArgumentKind::Normal);
+  assert(getDefaultArgumentKind() == DefaultArgumentKind::Normal ||
+         getDefaultArgumentKind() == DefaultArgumentKind::StoredProperty);
   assert(!stringRepresentation.empty());
 
   if (!DefaultValueAndFlags.getPointer()) {
@@ -5141,7 +5405,7 @@ void DefaultArgumentInitializer::changeFunction(
   }
 
   auto param = paramList->get(getIndex());
-  if (param->getDefaultValue())
+  if (param->getDefaultValue() || param->getStoredProperty())
     param->setDefaultArgumentInitContext(this);
 }
 
@@ -6262,8 +6526,10 @@ ConstructorDecl::getDelegatingOrChainedInitKind(DiagnosticEngine *diags,
       // Prior to Swift 5, cross-module initializers were permitted to be
       // non-delegating. However, if the struct isn't fixed-layout, we have to
       // be delegating because, well, we don't know the layout.
+      // A dynamic replacement is permitted to be non-delegating.
       if (NTD->isResilient() ||
-          containingModule->getASTContext().isSwiftVersionAtLeast(5)) {
+          (containingModule->getASTContext().isSwiftVersionAtLeast(5) &&
+           !getAttrs().getAttribute<DynamicReplacementAttr>())) {
         if (containingModule != NTD->getParentModule())
           Kind = BodyInitKind::Delegating;
       }
@@ -6424,7 +6690,10 @@ ClassDecl *ClassDecl::getSuperclassDecl() const {
 void ClassDecl::setSuperclass(Type superclass) {
   assert((!superclass || !superclass->hasArchetype())
          && "superclass must be interface type");
-  LazySemanticInfo.Superclass.setPointerAndInt(superclass, true);
+  LazySemanticInfo.SuperclassType.setPointerAndInt(superclass, true);
+  LazySemanticInfo.SuperclassDecl.setPointerAndInt(
+    superclass ? superclass->getClassOrBoundGenericClass() : nullptr,
+    true);
 }
 
 ClangNode Decl::getClangNodeImpl() const {
