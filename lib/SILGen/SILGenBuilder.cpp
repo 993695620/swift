@@ -35,9 +35,6 @@ SILGenModule &SILGenBuilder::getSILGenModule() const { return SGF.SGM; }
 SILGenBuilder::SILGenBuilder(SILGenFunction &SGF)
     : SILBuilder(SGF.F), SGF(SGF) {}
 
-SILGenBuilder::SILGenBuilder(SILGenFunction &SGF, SILBasicBlock *insertBB)
-    : SILBuilder(insertBB), SGF(SGF) {}
-
 SILGenBuilder::SILGenBuilder(SILGenFunction &SGF, SILBasicBlock *insertBB,
                              SmallVectorImpl<SILInstruction *> *insertedInsts)
     : SILBuilder(insertBB, insertedInsts), SGF(SGF) {}
@@ -47,162 +44,20 @@ SILGenBuilder::SILGenBuilder(SILGenFunction &SGF, SILBasicBlock *insertBB,
     : SILBuilder(insertBB, insertInst), SGF(SGF) {}
 
 //===----------------------------------------------------------------------===//
-//              Instruction Emission + Conformance Endowed APIs
-//===----------------------------------------------------------------------===//
-//
-// This section contains wrappers around SILBuilder SILValue APIs that add extra
-// conformances. These are the only places where we should be accessing
-// SILBuilder APIs directly.
-//
-
-MetatypeInst *SILGenBuilder::createMetatype(SILLocation loc, SILType metatype) {
-  auto theMetatype = metatype.castTo<MetatypeType>();
-  // Getting a nontrivial metatype requires forcing any conformances necessary
-  // to instantiate the type.
-  switch (theMetatype->getRepresentation()) {
-  case MetatypeRepresentation::Thin:
-    break;
-  case MetatypeRepresentation::Thick:
-  case MetatypeRepresentation::ObjC: {
-    // Walk the type recursively to look for substitutions we may need.
-    theMetatype.getInstanceType().findIf([&](Type t) -> bool {
-      auto *decl = t->getAnyNominal();
-      if (!decl)
-        return false;
-
-      if (isa<ProtocolDecl>(decl))
-        return false;
-
-      auto *genericSig = decl->getGenericSignature();
-      if (!genericSig)
-        return false;
-
-      auto subMap = t->getContextSubstitutionMap(getSILGenModule().SwiftModule,
-                                                 decl);
-      getSILGenModule().useConformancesFromSubstitutions(subMap);
-      return false;
-    });
-
-    break;
-  }
-  }
-
-  return SILBuilder::createMetatype(loc, metatype);
-}
-
-ApplyInst *SILGenBuilder::createApply(SILLocation loc, SILValue fn,
-                                      SILType substFnTy, SILType result,
-                                      SubstitutionMap subs,
-                                      ArrayRef<SILValue> args) {
-  getSILGenModule().useConformancesFromSubstitutions(subs);
-  return SILBuilder::createApply(loc, fn, subs, args, false);
-}
-
-TryApplyInst *
-SILGenBuilder::createTryApply(SILLocation loc, SILValue fn, SILType substFnTy,
-                              SubstitutionMap subs, ArrayRef<SILValue> args,
-                              SILBasicBlock *normalBB, SILBasicBlock *errorBB) {
-  getSILGenModule().useConformancesFromSubstitutions(subs);
-  return SILBuilder::createTryApply(loc, fn, subs, args, normalBB, errorBB);
-}
-
-BeginApplyInst *
-SILGenBuilder::createBeginApply(SILLocation loc, SILValue fn,
-                                SubstitutionMap subs,
-                                ArrayRef<SILValue> args) {
-  getSILGenModule().useConformancesFromSubstitutions(subs);
-  return SILBuilder::createBeginApply(loc, fn, subs, args, false);
-}
-
-PartialApplyInst *
-SILGenBuilder::createPartialApply(SILLocation loc, SILValue fn,
-                                  SILType substFnTy, SubstitutionMap subs,
-                                  ArrayRef<SILValue> args, SILType closureTy) {
-  getSILGenModule().useConformancesFromSubstitutions(subs);
-  return SILBuilder::createPartialApply(
-      loc, fn, subs, args,
-      closureTy.getAs<SILFunctionType>()->getCalleeConvention());
-}
-
-
-BuiltinInst *SILGenBuilder::createBuiltin(SILLocation loc, Identifier name,
-                                          SILType resultTy,
-                                          SubstitutionMap subs,
-                                          ArrayRef<SILValue> args) {
-  getSILGenModule().useConformancesFromSubstitutions(subs);
-  return SILBuilder::createBuiltin(loc, name, resultTy, subs, args);
-}
-
-InitExistentialAddrInst *SILGenBuilder::createInitExistentialAddr(
-    SILLocation loc, SILValue existential, CanType formalConcreteType,
-    SILType loweredConcreteType,
-    ArrayRef<ProtocolConformanceRef> conformances) {
-  for (auto conformance : conformances)
-    getSILGenModule().useConformance(conformance);
-
-  return SILBuilder::createInitExistentialAddr(
-      loc, existential, formalConcreteType, loweredConcreteType, conformances);
-}
-
-InitExistentialValueInst *SILGenBuilder::createInitExistentialValue(
-    SILLocation Loc, SILType ExistentialType, CanType FormalConcreteType,
-    SILValue Concrete, ArrayRef<ProtocolConformanceRef> Conformances) {
-  for (auto conformance : Conformances)
-    getSILGenModule().useConformance(conformance);
-
-  return SILBuilder::createInitExistentialValue(
-      Loc, ExistentialType, FormalConcreteType, Concrete, Conformances);
-}
-
-InitExistentialMetatypeInst *SILGenBuilder::createInitExistentialMetatype(
-    SILLocation loc, SILValue metatype, SILType existentialType,
-    ArrayRef<ProtocolConformanceRef> conformances) {
-  for (auto conformance : conformances)
-    getSILGenModule().useConformance(conformance);
-
-  return SILBuilder::createInitExistentialMetatype(
-      loc, metatype, existentialType, conformances);
-}
-
-InitExistentialRefInst *SILGenBuilder::createInitExistentialRef(
-    SILLocation loc, SILType existentialType, CanType formalConcreteType,
-    SILValue concreteValue, ArrayRef<ProtocolConformanceRef> conformances) {
-  for (auto conformance : conformances)
-    getSILGenModule().useConformance(conformance);
-
-  return SILBuilder::createInitExistentialRef(
-      loc, existentialType, formalConcreteType, concreteValue, conformances);
-}
-
-AllocExistentialBoxInst *SILGenBuilder::createAllocExistentialBox(
-    SILLocation loc, SILType existentialType, CanType concreteType,
-    ArrayRef<ProtocolConformanceRef> conformances) {
-  for (auto conformance : conformances)
-    getSILGenModule().useConformance(conformance);
-
-  return SILBuilder::createAllocExistentialBox(loc, existentialType,
-                                               concreteType, conformances);
-}
-
-//===----------------------------------------------------------------------===//
 //                             Managed Value APIs
 //===----------------------------------------------------------------------===//
-//
-// *NOTE* Please use SILGenBuilder SILValue APIs below. Otherwise, we
-// potentially do not get all of the conformances that we need.
-//
 
 ManagedValue SILGenBuilder::createPartialApply(SILLocation loc, SILValue fn,
-                                               SILType substFnTy,
                                                SubstitutionMap subs,
                                                ArrayRef<ManagedValue> args,
-                                               SILType closureTy) {
+                                               ParameterConvention calleeConvention) {
   llvm::SmallVector<SILValue, 8> values;
-  transform(args, std::back_inserter(values), [&](ManagedValue mv) -> SILValue {
+  llvm::transform(args, std::back_inserter(values),
+                  [&](ManagedValue mv) -> SILValue {
     return mv.forward(getSILGenFunction());
   });
   SILValue result =
-      createPartialApply(loc, fn, substFnTy, subs, values, closureTy);
+      createPartialApply(loc, fn, subs, values, calleeConvention);
   // Partial apply instructions create a box, so we need to put on a cleanup.
   return getSILGenFunction().emitManagedRValueWithCleanup(result);
 }
@@ -212,8 +67,8 @@ SILGenBuilder::createConvertFunction(SILLocation loc, ManagedValue fn,
                                      SILType resultTy,
                                      bool withoutActuallyEscaping) {
   CleanupCloner cloner(*this, fn);
-  SILValue result = SILBuilder::createConvertFunction(
-      loc, fn.forward(getSILGenFunction()), resultTy, withoutActuallyEscaping);
+  SILValue result = createConvertFunction(loc, fn.forward(getSILGenFunction()),
+                                          resultTy, withoutActuallyEscaping);
   return cloner.clone(result);
 }
 
@@ -355,10 +210,9 @@ ManagedValue SILGenBuilder::createAllocRef(
   llvm::SmallVector<SILType, 8> elementTypes(inputElementTypes.begin(),
                                              inputElementTypes.end());
   llvm::SmallVector<SILValue, 8> elementCountOperands;
-  std::transform(std::begin(inputElementCountOperands),
-                 std::end(inputElementCountOperands),
-                 std::back_inserter(elementCountOperands),
-                 [](ManagedValue mv) -> SILValue { return mv.getValue(); });
+  llvm::transform(inputElementCountOperands,
+                  std::back_inserter(elementCountOperands),
+                  [](ManagedValue mv) -> SILValue { return mv.getValue(); });
 
   AllocRefInst *i = createAllocRef(loc, refType, objc, canAllocOnStack,
                                    elementTypes, elementCountOperands);
@@ -372,10 +226,9 @@ ManagedValue SILGenBuilder::createAllocRefDynamic(
   llvm::SmallVector<SILType, 8> elementTypes(inputElementTypes.begin(),
                                              inputElementTypes.end());
   llvm::SmallVector<SILValue, 8> elementCountOperands;
-  std::transform(std::begin(inputElementCountOperands),
-                 std::end(inputElementCountOperands),
-                 std::back_inserter(elementCountOperands),
-                 [](ManagedValue mv) -> SILValue { return mv.getValue(); });
+  llvm::transform(inputElementCountOperands,
+                  std::back_inserter(elementCountOperands),
+                  [](ManagedValue mv) -> SILValue { return mv.getValue(); });
 
   AllocRefDynamicInst *i =
       createAllocRefDynamic(loc, operand.getValue(), refType, objc,
@@ -698,7 +551,8 @@ ManagedValue SILGenBuilder::createOptionalSome(SILLocation loc,
 
 ManagedValue SILGenBuilder::createManagedOptionalNone(SILLocation loc,
                                                       SILType type) {
-  if (!type.isAddressOnly(getModule()) || !SGF.silConv.useLoweredAddresses()) {
+  if (!type.isAddressOnly(getFunction()) ||
+      !SGF.silConv.useLoweredAddresses()) {
     SILValue noneValue = createOptionalNone(loc, type);
     return ManagedValue::forUnmanaged(noneValue);
   }
@@ -744,7 +598,7 @@ ManagedValue SILGenBuilder::createUncheckedBitCast(SILLocation loc,
   CleanupCloner cloner(*this, value);
   SILValue cast = createUncheckedBitCast(loc, value.getValue(), type);
 
-  // Currently SILBuilder::createUncheckedBitCast only produces these
+  // Currently createUncheckedBitCast only produces these
   // instructions. We assert here to make sure if this changes, this code is
   // updated.
   assert((isa<UncheckedTrivialBitCastInst>(cast) ||
@@ -888,8 +742,8 @@ BranchInst *SILGenBuilder::createBranch(SILLocation loc,
                                         SILBasicBlock *targetBlock,
                                         ArrayRef<ManagedValue> args) {
   llvm::SmallVector<SILValue, 8> newArgs;
-  transform(args, std::back_inserter(newArgs),
-            [&](ManagedValue mv) -> SILValue { return mv.forward(SGF); });
+  llvm::transform(args, std::back_inserter(newArgs),
+                  [&](ManagedValue mv) -> SILValue { return mv.forward(SGF); });
   return createBranch(loc, targetBlock, newArgs);
 }
 
@@ -916,10 +770,10 @@ ManagedValue SILGenBuilder::createTuple(SILLocation loc, SILType type,
   // If we have all trivial values, then just create the tuple and return. No
   // cleanups need to be cloned.
   if (iter == elements.end()) {
-    transform(elements, std::back_inserter(forwardedValues),
-              [&](ManagedValue mv) -> SILValue {
-                return mv.forward(getSILGenFunction());
-              });
+    llvm::transform(elements, std::back_inserter(forwardedValues),
+                    [&](ManagedValue mv) -> SILValue {
+                      return mv.forward(getSILGenFunction());
+                    });
     SILValue result = createTuple(loc, type, forwardedValues);
     return ManagedValue::forUnmanaged(result);
   }
@@ -928,10 +782,10 @@ ManagedValue SILGenBuilder::createTuple(SILLocation loc, SILType type,
   // instructions that forward ownership requiring that all input values have
   // the same ownership if they are non-trivial.
   CleanupCloner cloner(*this, *iter);
-  transform(elements, std::back_inserter(forwardedValues),
-            [&](ManagedValue mv) -> SILValue {
-              return mv.forward(getSILGenFunction());
-            });
+  llvm::transform(elements, std::back_inserter(forwardedValues),
+                  [&](ManagedValue mv) -> SILValue {
+                    return mv.forward(getSILGenFunction());
+                  });
   return cloner.clone(createTuple(loc, type, forwardedValues));
 }
 
@@ -965,14 +819,25 @@ void SILGenBuilder::emitDestructureValueOperation(
     SILLocation loc, ManagedValue value,
     llvm::function_ref<void(unsigned, ManagedValue)> func) {
   CleanupCloner cloner(*this, value);
-  SILBuilder::emitDestructureValueOperation(
+
+  // NOTE: We can not directly use SILBuilder::emitDestructureValueOperation()
+  // here since we need to create all of our cleanups before invoking \p
+  // func. This is necessary since our func may want to emit conditional code
+  // with an early exit, emitting unused cleanups from the current scope via the
+  // function emitBranchAndCleanups(). If we have not yet created those
+  // cleanups, we will introduce a leak along that path.
+  SmallVector<ManagedValue, 8> destructuredValues;
+  emitDestructureValueOperation(
       loc, value.forward(SGF), [&](unsigned index, SILValue subValue) {
-        return func(index, cloner.clone(subValue));
+        destructuredValues.push_back(cloner.clone(subValue));
       });
+  for (auto p : llvm::enumerate(destructuredValues)) {
+    func(p.index(), p.value());
+  }
 }
 
 ManagedValue SILGenBuilder::createProjectBox(SILLocation loc, ManagedValue mv,
                                              unsigned index) {
-  auto *pbi = SILBuilder::createProjectBox(loc, mv.getValue(), index);
+  auto *pbi = createProjectBox(loc, mv.getValue(), index);
   return ManagedValue::forUnmanaged(pbi);
 }

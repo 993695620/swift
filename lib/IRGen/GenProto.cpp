@@ -32,6 +32,7 @@
 #include "swift/AST/Types.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/LazyResolver.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SubstitutionMap.h"
@@ -854,7 +855,7 @@ static bool hasDependentTypeWitness(
     return false;
 
   // Check whether any of the associated types are dependent.
-  if (conformance->forEachTypeWitness(nullptr,
+  if (conformance->forEachTypeWitness(
         [&](AssociatedTypeDecl *requirement, Type type,
             TypeDecl *explicitDecl) -> bool {
           // Skip associated types that don't have witness table entries.
@@ -863,7 +864,8 @@ static bool hasDependentTypeWitness(
 
           // RESILIENCE: this could be an opaque conformance
           return type->hasTypeParameter();
-       })) {
+       },
+       /*useResolver=*/true)) {
     return true;
   }
 
@@ -1100,7 +1102,8 @@ public:
   llvm::Value *getTable(IRGenFunction &IGF,
                         llvm::Value **typeMetadataCache) const override {
     // If we're looking up a dependent type, we can't cache the result.
-    if (Conformance->getType()->hasArchetype()) {
+    if (Conformance->getType()->hasArchetype() ||
+        Conformance->getType()->hasDynamicSelfType()) {
       return emitWitnessTableAccessorCall(IGF, Conformance,
                                           typeMetadataCache);
     }
@@ -1287,8 +1290,7 @@ public:
 #endif
 
       auto associate =
-        Conformance.getTypeWitness(requirement.getAssociation(), nullptr)
-          ->getCanonicalType();
+          Conformance.getTypeWitness(requirement.getAssociation());
       llvm::Constant *witness =
           IGM.getAssociatedTypeWitness(associate, /*inProtocolContext=*/false);
       Table.addBitCast(witness, IGM.Int8PtrTy);
@@ -1422,7 +1424,7 @@ void WitnessTableBuilder::build() {
   TableSize = Table.size();
 }
 
-llvm::Constant *IRGenModule::getAssociatedTypeWitness(CanType type,
+llvm::Constant *IRGenModule::getAssociatedTypeWitness(Type type,
                                                       bool inProtocolContext) {
   // FIXME: If we can directly reference constant type metadata, do so.
 
@@ -1431,7 +1433,7 @@ llvm::Constant *IRGenModule::getAssociatedTypeWitness(CanType type,
   auto role = inProtocolContext
     ? MangledTypeRefRole::DefaultAssociatedTypeWitness
     : MangledTypeRefRole::Metadata;
-  auto typeRef = getTypeRef(type, role);
+  auto typeRef = getTypeRef(type, /*generic signature*/nullptr, role).first;
 
   // Set the low bit to indicate that this is a mangled name.
   auto witness = llvm::ConstantExpr::getPtrToInt(typeRef, IntPtrTy);
@@ -1468,6 +1470,11 @@ void WitnessTableBuilder::defineAssociatedTypeWitnessTableAccessFunction(
                                 CanType associatedType,
                                 ProtocolConformanceRef associatedConformance) {
   bool hasArchetype = associatedType->hasArchetype();
+  OpaqueTypeArchetypeType *associatedRootOpaqueType = nullptr;
+  if (auto assocArchetype = dyn_cast<ArchetypeType>(associatedType)) {
+    associatedRootOpaqueType = dyn_cast<OpaqueTypeArchetypeType>(
+                                                     assocArchetype->getRoot());
+  }
 
   assert(isa<NormalProtocolConformance>(Conformance) && "has associated type");
 
@@ -1508,16 +1515,6 @@ void WitnessTableBuilder::defineAssociatedTypeWitnessTableAccessFunction(
 
   const ConformanceInfo *conformanceI = nullptr;
 
-  // Rewrite (abstract) self conformances to the concrete conformance.
-  if (associatedConformance.isAbstract() && !hasArchetype) {
-    // This must be a self conformance.
-    auto proto = associatedConformance.getRequirement();
-    assert(proto->requiresSelfConformanceWitnessTable());
-    assert(cast<ProtocolType>(associatedType)->getDecl() == proto);
-    auto concreteConformance = IGF.IGM.Context.getSelfConformance(proto);
-    associatedConformance = ProtocolConformanceRef(concreteConformance);
-  }
-
   if (associatedConformance.isConcrete()) {
     assert(associatedType->isEqual(associatedConformance.getConcrete()->getType()));
 
@@ -1533,7 +1530,7 @@ void WitnessTableBuilder::defineAssociatedTypeWitnessTableAccessFunction(
   }
 
   // If there are no archetypes, return a reference to the table.
-  if (!hasArchetype) {
+  if (!hasArchetype && !associatedRootOpaqueType) {
     auto wtable = conformanceI->getTable(IGF, &associatedTypeMetadata);
     IGF.Builder.CreateRet(wtable);
     return;
@@ -1602,8 +1599,7 @@ void WitnessTableBuilder::collectResilientWitnesses(
     if (entry.getKind() == SILWitnessTable::AssociatedType) {
       // Associated type witness.
       auto assocType = entry.getAssociatedTypeWitness().Requirement;
-      auto associate = conformance.getTypeWitness(assocType, nullptr)
-          ->getCanonicalType();
+      auto associate = conformance.getTypeWitness(assocType);
 
       llvm::Constant *witness =
           IGM.getAssociatedTypeWitness(associate, /*inProtocolContext=*/false);
@@ -2163,11 +2159,8 @@ void IRGenModule::emitSILWitnessTable(SILWitnessTable *wt) {
   // Record this conformance descriptor.
   addProtocolConformance(std::move(description));
 
-  // Trigger the lazy emission of the foreign type metadata.
-  CanType conformingType = conf->getType()->getCanonicalType();
-  if (requiresForeignTypeMetadata(conformingType)) {
-    (void)getAddrOfForeignTypeMetadataCandidate(conformingType);
-  }
+  IRGen.noteUseOfTypeContextDescriptor(conf->getType()->getAnyNominal(),
+                                       RequireMetadata);
 }
 
 /// True if a function's signature in LLVM carries polymorphic parameters.
@@ -2747,18 +2740,19 @@ llvm::Value *irgen::emitWitnessTableRef(IRGenFunction &IGF,
   assert(Lowering::TypeConverter::protocolRequiresWitnessTable(proto)
          && "protocol does not have witness tables?!");
 
+  // Look through any opaque types we're allowed to.
+  if (srcType->hasOpaqueArchetype()) {
+    std::tie(srcType, conformance) =
+      IGF.IGM.substOpaqueTypesWithUnderlyingTypes(srcType, conformance);
+  }
+  
   // If we don't have concrete conformance information, the type must be
   // an archetype and the conformance must be via one of the protocol
   // requirements of the archetype. Look at what's locally bound.
   ProtocolConformance *concreteConformance;
   if (conformance.isAbstract()) {
-    if (auto archetype = dyn_cast<ArchetypeType>(srcType))
-      return emitArchetypeWitnessTableRef(IGF, archetype, proto);
-
-    // Otherwise, this must be a self-conformance.
-    assert(proto->requiresSelfConformanceWitnessTable());
-    assert(cast<ProtocolType>(srcType)->getDecl() == proto);
-    concreteConformance = IGF.IGM.Context.getSelfConformance(proto);
+    auto archetype = cast<ArchetypeType>(srcType);
+    return emitArchetypeWitnessTableRef(IGF, archetype, proto);
 
   // All other source types should be concrete enough that we have
   // conformance info for them.  However, that conformance info might be
@@ -2966,6 +2960,10 @@ GenericTypeRequirements::GenericTypeRequirements(IRGenModule &IGM,
                                                  NominalTypeDecl *typeDecl)
     : TheDecl(typeDecl) {
 
+  // FIXME: Remove this once getGenericSignature() is a request.
+  if (!typeDecl->hasInterfaceType())
+    IGM.Context.getLazyResolver()->resolveDeclSignature(typeDecl);
+
   // We only need to do something here if the declaration context is
   // somehow generic.
   auto ncGenerics = typeDecl->getGenericSignatureOfContext();
@@ -2973,14 +2971,12 @@ GenericTypeRequirements::GenericTypeRequirements(IRGenModule &IGM,
 
   // Construct a representative function type.
   auto generics = ncGenerics->getCanonicalSignature();
-  CanSILFunctionType fnType = [&]() -> CanSILFunctionType {
-    return SILFunctionType::get(generics, SILFunctionType::ExtInfo(),
+  auto fnType = SILFunctionType::get(generics, SILFunctionType::ExtInfo(),
                                 SILCoroutineKind::None,
                                 /*callee*/ ParameterConvention::Direct_Unowned,
                                 /*params*/ {}, /*yields*/ {},
                                 /*results*/ {}, /*error*/ None,
                                 IGM.Context);
-  }();
 
   // Figure out what we're actually still required to pass 
   PolymorphicConvention convention(IGM, fnType);

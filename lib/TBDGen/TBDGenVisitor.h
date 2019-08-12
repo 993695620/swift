@@ -91,6 +91,8 @@ public:
   /// Adds the global symbols associated with the first file.
   void addFirstFileSymbols();
 
+  void visitDefaultArguments(ValueDecl *VD, ParameterList *PL);
+
   void visitAbstractFunctionDecl(AbstractFunctionDecl *AFD);
 
   void visitAccessorDecl(AccessorDecl *AD);
@@ -104,6 +106,8 @@ public:
   void visitDestructorDecl(DestructorDecl *DD);
 
   void visitExtensionDecl(ExtensionDecl *ED);
+  
+  void visitFuncDecl(FuncDecl *FD);
 
   void visitProtocolDecl(ProtocolDecl *PD);
 
@@ -112,6 +116,8 @@ public:
   void visitVarDecl(VarDecl *VD);
 
   void visitEnumDecl(EnumDecl *ED);
+
+  void visitEnumElementDecl(EnumElementDecl *EED);
 
   void visitDecl(Decl *D) {}
 };

@@ -22,6 +22,7 @@
 #include "swift/AST/ASTDemangler.h"
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/GenericSignatureBuilder.h"
@@ -29,7 +30,6 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
-#include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/ManglingMacros.h"
 
@@ -102,7 +102,7 @@ ASTBuilder::createBuiltinType(StringRef builtinName,
 
     ModuleDecl::AccessPathTy accessPath;
     StringRef strippedName =
-          builtinName.drop_front(strlen(BUILTIN_TYPE_NAME_PREFIX));
+        builtinName.drop_front(BUILTIN_TYPE_NAME_PREFIX.size());
     Ctx.TheBuiltinModule->lookupValue(accessPath,
                                       Ctx.getIdentifier(strippedName),
                                       NLKind::QualifiedLookup,
@@ -155,7 +155,9 @@ Type ASTBuilder::createNominalType(GenericTypeDecl *decl, Type parent) {
   // Imported types can be renamed to be members of other (non-generic)
   // types, but the mangling does not have a parent type. Just use the
   // declared type directly in this case and skip the parent check below.
-  if (nominalDecl->hasClangNode() && !nominalDecl->isGenericContext())
+  bool isImported = nominalDecl->hasClangNode() ||
+      nominalDecl->getAttrs().hasAttribute<ClangImporterSynthesizedTypeAttr>();
+  if (isImported && !nominalDecl->isGenericContext())
     return nominalDecl->getDeclaredType();
 
   // Validate the parent type.
@@ -177,7 +179,9 @@ Type ASTBuilder::createTypeAliasType(GenericTypeDecl *decl, Type parent) {
   // Imported types can be renamed to be members of other (non-generic)
   // types, but the mangling does not have a parent type. Just use the
   // declared type directly in this case and skip the parent check below.
-  if (aliasDecl->hasClangNode() && !aliasDecl->isGenericContext())
+  bool isImported = aliasDecl->hasClangNode() ||
+      aliasDecl->getAttrs().hasAttribute<ClangImporterSynthesizedTypeAttr>();
+  if (isImported && !aliasDecl->isGenericContext())
     return aliasDecl->getDeclaredInterfaceType();
 
   // Validate the parent type.
@@ -203,6 +207,9 @@ static SubstitutionMap
 createSubstitutionMapFromGenericArgs(GenericSignature *genericSig,
                                      ArrayRef<Type> args,
                                      ModuleDecl *moduleDecl) {
+  if (!genericSig)
+    return SubstitutionMap();
+  
   SmallVector<GenericTypeParamType *, 4> genericParams;
   genericSig->forEachParam([&](GenericTypeParamType *gp, bool canonical) {
     if (canonical)
@@ -245,6 +252,45 @@ Type ASTBuilder::createBoundGenericType(GenericTypeDecl *decl,
   // requirements of the signature here.
   auto substType = origType.subst(subs);
   return substType;
+}
+
+Type ASTBuilder::resolveOpaqueType(NodePointer opaqueDescriptor,
+                                   ArrayRef<ArrayRef<Type>> args,
+                                   unsigned ordinal) {
+  if (opaqueDescriptor->getKind() == Node::Kind::OpaqueReturnTypeOf) {
+    auto definingDecl = opaqueDescriptor->getChild(0);
+    auto definingGlobal = Factory.createNode(Node::Kind::Global);
+    definingGlobal->addChild(definingDecl, Factory);
+    auto mangledName = mangleNode(definingGlobal);
+    
+    auto moduleNode = findModuleNode(definingDecl);
+    if (!moduleNode)
+      return Type();
+    auto parentModule = findModule(moduleNode);
+    if (!parentModule)
+      return Type();
+
+    auto opaqueDecl = parentModule->lookupOpaqueResultType(mangledName,
+                                                           Resolver);
+    if (!opaqueDecl)
+      return Type();
+    // TODO: multiple opaque types
+    assert(ordinal == 0 && "not implemented");
+    if (ordinal != 0)
+      return Type();
+    
+    SmallVector<Type, 8> allArgs;
+    for (auto argSet : args) {
+      allArgs.append(argSet.begin(), argSet.end());
+    }
+
+    SubstitutionMap subs = createSubstitutionMapFromGenericArgs(
+                      opaqueDecl->getGenericSignature(), allArgs, parentModule);
+    return OpaqueTypeArchetypeType::get(opaqueDecl, subs);
+  }
+  
+  // TODO: named opaque types
+  return Type();
 }
 
 Type ASTBuilder::createBoundGenericType(GenericTypeDecl *decl,
@@ -337,10 +383,14 @@ Type ASTBuilder::createFunctionType(
 
   auto einfo = AnyFunctionType::ExtInfo(representation,
                                         /*throws*/ flags.throws());
-  if (flags.isEscaping())
-    einfo = einfo.withNoEscape(false);
-  else
-    einfo = einfo.withNoEscape(true);
+
+  if (representation == FunctionTypeRepresentation::Swift ||
+      representation == FunctionTypeRepresentation::Block) {
+    if (flags.isEscaping())
+      einfo = einfo.withNoEscape(false);
+    else
+      einfo = einfo.withNoEscape(true);
+  }
 
   // The result type must be materializable.
   if (!output->isMaterializable()) return Type();
@@ -360,10 +410,6 @@ Type ASTBuilder::createFunctionType(
                               .withValueOwnership(ownership)
                               .withVariadic(flags.isVariadic())
                               .withAutoClosure(flags.isAutoClosure());
-
-    if (auto *fnType = type->getAs<FunctionType>())
-      if (!fnType->isNoEscape())
-        parameterFlags = parameterFlags.withEscaping(true);
 
     funcParams.push_back(AnyFunctionType::Param(type, label, parameterFlags));
   }
@@ -391,6 +437,7 @@ getParameterConvention(ImplParameterConvention conv) {
   case Demangle::ImplParameterConvention::Direct_Guaranteed:
     return ParameterConvention::Direct_Guaranteed;
   }
+  llvm_unreachable("covered switch");
 }
 
 static ResultConvention getResultConvention(ImplResultConvention conv) {
@@ -406,6 +453,7 @@ static ResultConvention getResultConvention(ImplResultConvention conv) {
   case Demangle::ImplResultConvention::Autoreleased:
     return ResultConvention::Autoreleased;
   }
+  llvm_unreachable("covered switch");
 }
 
 Type ASTBuilder::createImplFunctionType(
@@ -502,6 +550,7 @@ getMetatypeRepresentation(ImplMetatypeRepresentation repr) {
   case Demangle::ImplMetatypeRepresentation::ObjC:
     return MetatypeRepresentation::ObjC;
   }
+  llvm_unreachable("covered switch");
 }
 
 Type ASTBuilder::createExistentialMetatypeType(Type instance,
@@ -974,31 +1023,14 @@ ASTBuilder::findTypeDecl(DeclContext *dc,
   return result;
 }
 
-static Optional<ClangTypeKind>
-getClangTypeKindForNodeKind(Demangle::Node::Kind kind) {
-  switch (kind) {
-  case Demangle::Node::Kind::Protocol:
-    return ClangTypeKind::ObjCProtocol;
-  case Demangle::Node::Kind::Class:
-    return ClangTypeKind::ObjCClass;
-  case Demangle::Node::Kind::TypeAlias:
-    return ClangTypeKind::Typedef;
-  case Demangle::Node::Kind::Structure:
-  case Demangle::Node::Kind::Enum:
-    return ClangTypeKind::Tag;
-  default:
-    return None;
-  }
-}
-
-GenericTypeDecl *
-ASTBuilder::findForeignTypeDecl(StringRef name,
-                                StringRef relatedEntityKind,
-                                ForeignModuleKind foreignKind,
-                                Demangle::Node::Kind kind) {
+GenericTypeDecl *ASTBuilder::findForeignTypeDecl(StringRef name,
+                                                 StringRef relatedEntityKind,
+                                                 ForeignModuleKind foreignKind,
+                                                 Demangle::Node::Kind kind) {
   // Check to see if we have an importer loaded.
-  auto importer = static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
-  if (!importer) return nullptr;
+  auto importer = Ctx.getClangModuleLoader();
+  if (!importer)
+    return nullptr;
 
   // Find the unique declaration that has the right kind.
   struct Consumer : VisibleDeclConsumer {
@@ -1008,9 +1040,12 @@ ASTBuilder::findForeignTypeDecl(StringRef name,
 
     explicit Consumer(Demangle::Node::Kind kind) : ExpectedKind(kind) {}
 
-    void foundDecl(ValueDecl *decl, DeclVisibilityKind reason) override {
-      if (HadError) return;
-      if (decl == Result) return;
+    void foundDecl(ValueDecl *decl, DeclVisibilityKind reason,
+                   DynamicLookupInfo dynamicLookupInfo = {}) override {
+      if (HadError)
+        return;
+      if (decl == Result)
+        return;
       if (!Result) {
         Result = dyn_cast<GenericTypeDecl>(decl);
         HadError |= !Result;
@@ -1021,33 +1056,27 @@ ASTBuilder::findForeignTypeDecl(StringRef name,
     }
   } consumer(kind);
 
+  auto found = [&](TypeDecl *found) {
+    consumer.foundDecl(found, DeclVisibilityKind::VisibleAtTopLevel);
+  };
+
   switch (foreignKind) {
   case ForeignModuleKind::SynthesizedByImporter:
     if (!relatedEntityKind.empty()) {
-      Optional<ClangTypeKind> lookupKind = getClangTypeKindForNodeKind(kind);
-      if (!lookupKind)
-        return nullptr;
-      importer->lookupRelatedEntity(name, lookupKind.getValue(),
-                                    relatedEntityKind, [&](TypeDecl *found) {
-        consumer.foundDecl(found, DeclVisibilityKind::VisibleAtTopLevel);
-      });
+      importer->lookupRelatedEntity(name, relatedEntityKind, found);
       break;
     }
     importer->lookupValue(Ctx.getIdentifier(name), consumer);
-    if (consumer.Result) {
-      consumer.Result =
-          getAcceptableTypeDeclCandidate(consumer.Result,kind);
-    }
+    if (consumer.Result)
+      consumer.Result = getAcceptableTypeDeclCandidate(consumer.Result, kind);
     break;
-  case ForeignModuleKind::Imported: {
-    Optional<ClangTypeKind> lookupKind = getClangTypeKindForNodeKind(kind);
-    if (!lookupKind)
-      return nullptr;
-    importer->lookupTypeDecl(name, lookupKind.getValue(),
-                             [&](TypeDecl *found) {
-      consumer.foundDecl(found, DeclVisibilityKind::VisibleAtTopLevel);
-    });
-  }
+  case ForeignModuleKind::Imported:
+    importer->lookupTypeDecl(name, kind, found);
+
+    // Try the DWARFImporter if it exists.
+    if (!consumer.Result)
+      if (auto *dwarf_importer = Ctx.getDWARFModuleLoader())
+        dwarf_importer->lookupTypeDecl(name, kind, found);
   }
 
   return consumer.Result;

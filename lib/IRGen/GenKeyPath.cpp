@@ -648,101 +648,15 @@ getInitializerForComputedComponent(IRGenModule &IGM,
   return initFn;
 }
 
-/// Emit a generator function to produce a reference to a type or
-/// protocol conformance metadata record.
-/// TODO: It would be much better to emit typeref strings and use runtime
-/// demangling here.
 static llvm::Constant *
-emitGeneratorForKeyPath(IRGenModule &IGM,
-                        StringRef name, CanType type, llvm::Type *returnType,
-                        GenericEnvironment *genericEnv,
-                        ArrayRef<GenericRequirement> requirements,
-                        llvm::function_ref<void(IRGenFunction&,CanType)> emit) {
-
-  return IGM.getAddrOfStringForMetadataRef(name, /*alignment=*/2,
-      /*shouldSetLowBit=*/true,
-      [&](ConstantInitBuilder &B) {
-        // Build a stub that loads the necessary bindings from the key path's
-        // argument buffer then fetches the metadata.
-        auto fnTy = llvm::FunctionType::get(returnType,
-                                            {IGM.Int8PtrTy}, /*vararg*/ false);
-        auto accessorThunk =
-          llvm::Function::Create(fnTy, llvm::GlobalValue::PrivateLinkage,
-                                 name, IGM.getModule());
-        accessorThunk->setAttributes(IGM.constructInitialAttributes());
-        {
-          IRGenFunction IGF(IGM, accessorThunk);
-          if (IGM.DebugInfo)
-            IGM.DebugInfo->emitArtificialFunction(IGF, accessorThunk);
-
-          if (type->hasTypeParameter()) {
-            auto bindingsBufPtr = IGF.collectParameters().claimNext();
-
-            bindFromGenericRequirementsBuffer(IGF, requirements,
-                Address(bindingsBufPtr, IGM.getPointerAlignment()),
-                MetadataState::Complete,
-                [&](CanType t) {
-                  return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
-                });
-
-            type = genericEnv->mapTypeIntoContext(type)->getCanonicalType();
-          }
-          emit(IGF, type);
-        }
-
-        // Form the mangled name with its relative reference.
-        auto S = B.beginStruct();
-        S.setPacked(true);
-        S.add(llvm::ConstantInt::get(IGM.Int8Ty, 255));
-        S.add(llvm::ConstantInt::get(IGM.Int8Ty, 9));
-        S.addRelativeAddress(accessorThunk);
-
-        // And a null terminator!
-        S.addInt(IGM.Int8Ty, 0);
-
-        return S.finishAndCreateFuture();
-      });
-}
-
-static llvm::Constant *
-emitMetadataGeneratorForKeyPath(IRGenModule &IGM,
-                                CanType type,
-                                GenericEnvironment *genericEnv,
-                                ArrayRef<GenericRequirement> requirements) {
+emitMetadataTypeRefForKeyPath(IRGenModule &IGM, CanType type) {
   // Produce a mangled name for the type.
-  auto constant = IGM.getTypeRef(type, MangledTypeRefRole::Metadata);
+  auto constant = IGM.getTypeRef(type, MangledTypeRefRole::Metadata).first;
+  
+  // Mask the bottom bit to tell the key path runtime this is a mangled name
+  // rather than a direct reference.
   auto bitConstant = llvm::ConstantInt::get(IGM.IntPtrTy, 1);
   return llvm::ConstantExpr::getGetElementPtr(nullptr, constant, bitConstant);
-}
-
-static llvm::Constant *
-emitWitnessTableGeneratorForKeyPath(IRGenModule &IGM,
-                                    CanType type,
-                                    ProtocolConformanceRef conformance,
-                                    GenericEnvironment *genericEnv,
-                                    ArrayRef<GenericRequirement> requirements) {
-  CanGenericSignature genericSig;
-  if (genericEnv)
-    genericSig = genericEnv->getGenericSignature()->getCanonicalSignature();
-
-  IRGenMangler mangler;
-  std::string symbolName =
-    mangler.mangleSymbolNameForKeyPathMetadata(
-      "keypath_get_witness_table", genericSig, type, conformance);
-
-  // TODO: Use the standard conformance accessor when there are no arguments
-  // and the conformance accessor is defined.
-  return emitGeneratorForKeyPath(IGM, symbolName, type,
-    IGM.WitnessTablePtrTy,
-    genericEnv, requirements,
-    [&](IRGenFunction &IGF, CanType substType) {
-      if (type->hasTypeParameter())
-        conformance = conformance.subst(type,
-          QueryInterfaceTypeSubstitutions(genericEnv),
-          LookUpConformanceInSignature(*genericEnv->getGenericSignature()));
-      auto ret = emitWitnessTableRef(IGF, substType, conformance);
-      IGF.Builder.CreateRet(ret);
-    });
 }
 
 static unsigned getClassFieldIndex(ClassDecl *classDecl, VarDecl *property) {
@@ -833,26 +747,50 @@ emitKeyPathComponent(IRGenModule &IGM,
       fields.addInt32(fieldOffset.getValue());
       break;
     }
-    
+
+    auto *classDecl = baseTy->getClassOrBoundGenericClass();
+    auto loweredClassTy = loweredBaseTy;
+
+    // Recover class decl from superclass constraint
+    if (!classDecl && genericEnv) {
+      auto ty = genericEnv->mapTypeIntoContext(baseTy)->getCanonicalType();
+      auto archetype = dyn_cast<ArchetypeType>(ty);
+      if (archetype && archetype->requiresClass()) {
+        auto superClassTy = ty->getSuperclass(false)->getCanonicalType();
+        classDecl = superClassTy->getClassOrBoundGenericClass();
+        loweredClassTy =
+            IGM.getLoweredType(AbstractionPattern::getOpaque(),
+                               superClassTy->getWithoutSpecifierType());
+      }
+    }
+
     // For a class, we may know the fixed offset of a field at compile time,
     // or we may need to fetch it at instantiation time. Depending on the
     // ObjC-ness and resilience of the class hierarchy, there might be a few
     // different ways we need to go about this.
-    if (loweredBaseTy.getClassOrBoundGenericClass()) {
+    if (loweredClassTy.getClassOrBoundGenericClass()) {
 
       // Use the property's class type to determine the field access.
       auto propertyBaseDecl = property->getDeclContext()->getSelfClassDecl();
       auto currentBaseTy =
-          loweredBaseTy.getASTType()->getSuperclassForDecl(propertyBaseDecl);
+          loweredClassTy.getASTType()->getSuperclassForDecl(propertyBaseDecl);
       assert(currentBaseTy->getClassOrBoundGenericClass() == propertyBaseDecl);
-      loweredBaseTy =
+      loweredClassTy =
           IGM.getLoweredType(AbstractionPattern::getOpaque(), currentBaseTy);
 
-      switch (getClassFieldAccess(IGM, loweredBaseTy, property)) {
+      auto loweredBaseContextTy =
+          SILType::getPrimitiveObjectType(loweredClassTy.getASTType());
+      if (!loweredClassTy.getASTType()->hasArchetype())
+        loweredBaseContextTy = SILType::getPrimitiveObjectType(
+            GenericEnvironment::mapTypeIntoContext(genericEnv,
+                                                   loweredClassTy.getASTType())
+                ->getCanonicalType());
+
+      switch (getClassFieldAccess(IGM, loweredBaseContextTy, property)) {
       case FieldAccess::ConstantDirect: {
         // Known constant fixed offset.
         auto offset = tryEmitConstantClassFragilePhysicalMemberOffset(IGM,
-                                                                loweredBaseTy,
+                                                                loweredClassTy,
                                                                 property);
         assert(offset && "no constant offset for ConstantDirect field?!");
         addFixedOffset(/*struct*/ false, property->isLet(), offset);
@@ -875,10 +813,8 @@ emitKeyPathComponent(IRGenModule &IGM,
         auto header = KeyPathComponentHeader
           ::forClassComponentWithUnresolvedFieldOffset(property->isLet());
         fields.addInt32(header.getData());
-        auto fieldOffset =
-          getClassFieldOffsetOffset(IGM,
-                                    loweredBaseTy.getClassOrBoundGenericClass(),
-                                    property);
+        auto fieldOffset = getClassFieldOffsetOffset(
+            IGM, loweredClassTy.getClassOrBoundGenericClass(), property);
         fields.addInt32(fieldOffset.getValue());
         break;
       }
@@ -911,16 +847,15 @@ emitKeyPathComponent(IRGenModule &IGM,
             if (!reqt.Protocol) {
               // Type requirement.
               externalSubArgs.push_back(
-                emitMetadataGeneratorForKeyPath(IGM, substType,
-                                                genericEnv, requirements));
+                emitMetadataTypeRefForKeyPath(IGM, substType));
             } else {
               // Protocol requirement.
               auto conformance = subs.lookupConformance(
                            reqt.TypeParameter->getCanonicalType(), reqt.Protocol);
               externalSubArgs.push_back(
-                emitWitnessTableGeneratorForKeyPath(IGM, substType,
-                                                    *conformance,
-                                                    genericEnv, requirements));
+                IGM.emitWitnessTableRefString(substType, *conformance,
+                      genericEnv ? genericEnv->getGenericSignature() : nullptr,
+                      /*shouldSetLowBit*/ true));
             }
           });
       }
@@ -1042,6 +977,20 @@ emitKeyPathComponent(IRGenModule &IGM,
       // the property.
       auto property = id.getProperty();
       idKind = KeyPathComponentHeader::StoredPropertyIndex;
+      auto *classDecl = baseTy->getClassOrBoundGenericClass();
+      auto loweredClassTy = loweredBaseTy;
+      // Recover class decl from superclass constraint
+      if (!classDecl && genericEnv) {
+        auto ty = genericEnv->mapTypeIntoContext(baseTy)->getCanonicalType();
+        auto archetype = dyn_cast<ArchetypeType>(ty);
+        if (archetype && archetype->requiresClass()) {
+          auto superClassTy = ty->getSuperclass(false)->getCanonicalType();
+          classDecl = superClassTy->getClassOrBoundGenericClass();
+          loweredClassTy =
+              IGM.getLoweredType(AbstractionPattern::getOpaque(),
+                                 superClassTy->getWithoutSpecifierType());
+        }
+      }
       if (auto struc = baseTy->getStructOrBoundGenericStruct()) {
         // Scan the stored properties of the struct to find the index. We should
         // only ever use a struct field as a uniquing key from inside the
@@ -1058,12 +1007,12 @@ emitKeyPathComponent(IRGenModule &IGM,
         }
         assert(structIdx && "not a stored property of the struct?!");
         idValue = llvm::ConstantInt::get(IGM.SizeTy, structIdx.getValue());
-      } else if (auto *classDecl = baseTy->getClassOrBoundGenericClass()) {
+      } else if (classDecl) {
         // TODO: This field index would require runtime resolution with Swift
         // native class resilience. We never directly access ObjC-imported
         // ivars so we can disregard ObjC ivar resilience for this computation
         // and start counting at the Swift native root.
-        switch (getClassFieldAccess(IGM, loweredBaseTy, property)) {
+        switch (getClassFieldAccess(IGM, loweredClassTy, property)) {
         case FieldAccess::ConstantDirect:
         case FieldAccess::ConstantIndirect:
         case FieldAccess::NonConstantDirect:
@@ -1233,9 +1182,9 @@ IRGenModule::getAddrOfKeyPathPattern(KeyPathPattern *pattern,
     getAddrOfGenericEnvironment(pattern->getGenericSignature()));
   // Store type references for the root and leaf.
   fields.addRelativeAddress(
-    emitMetadataGeneratorForKeyPath(*this, rootTy, genericEnv, requirements));
+    emitMetadataTypeRefForKeyPath(*this, rootTy));
   fields.addRelativeAddress(
-    emitMetadataGeneratorForKeyPath(*this, valueTy, genericEnv, requirements));
+    emitMetadataTypeRefForKeyPath(*this, valueTy));
   
   // Add a pointer to the ObjC KVC compatibility string, if there is one, or
   // null otherwise.
@@ -1289,8 +1238,7 @@ IRGenModule::getAddrOfKeyPathPattern(KeyPathPattern *pattern,
     // For all but the last component, we pack in the type of the component.
     if (i + 1 != pattern->getComponents().size()) {
       fields.addRelativeAddress(
-        emitMetadataGeneratorForKeyPath(*this, component.getComponentType(),
-                                        genericEnv, requirements));
+        emitMetadataTypeRefForKeyPath(*this, component.getComponentType()));
     }
     baseTy = component.getComponentType();
   }

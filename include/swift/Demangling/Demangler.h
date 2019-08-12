@@ -348,7 +348,10 @@ public:
 enum class SymbolicReferenceKind : uint8_t {
   /// A symbolic reference to a context descriptor, representing the
   /// (unapplied generic) context.
-  Context,  
+  Context,
+  /// A symbolic reference to an accessor function, which can be executed in
+  /// the process to get a pointer to the referenced entity.
+  AccessorFunctionReference,
 };
 
 using SymbolicReferenceResolver_t = NodePointer (SymbolicReferenceKind,
@@ -444,7 +447,21 @@ protected:
     return popNode();
   }
 
-  void init(StringRef MangledName);
+  /// This class handles preparing the initial state for a demangle job in a reentrant way, pushing the
+  /// existing state back when a demangle job is completed.
+  class DemangleInitRAII {
+    Demangler &Dem;
+    Vector<NodePointer> NodeStack;
+    Vector<NodePointer> Substitutions;
+    int NumWords;
+    StringRef Text;
+    size_t Pos;
+    
+  public:
+    DemangleInitRAII(Demangler &Dem, StringRef MangledName);
+    ~DemangleInitRAII();
+  };
+  friend DemangleInitRAII;
   
   void addSubstitution(NodePointer Nd) {
     if (Nd)
@@ -474,6 +491,7 @@ protected:
   int demangleNatural();
   int demangleIndex();
   NodePointer demangleIndexAsNode();
+  NodePointer demangleDependentConformanceIndex();
   NodePointer demangleIdentifier();
   NodePointer demangleOperatorIdentifier();
 
@@ -559,6 +577,9 @@ protected:
   NodePointer demangleSymbolicReference(unsigned char rawKind,
                                         const void *at);
 
+  bool demangleBoundGenerics(Vector<NodePointer> &TypeListList,
+                             NodePointer &RetroactiveConformances);
+  
   void dump();
 
 public:

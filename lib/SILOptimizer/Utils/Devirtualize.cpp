@@ -636,6 +636,7 @@ static ApplySite replaceApplySite(SILBuilder &B, SILLocation Loc,
     return replacePartialApplyInst(B, Loc, OldPAI, NewFn, NewSubs, NewArgs);
   }
   }
+  llvm_unreachable("covered switch");
 }
 
 /// Delete an apply site that's been successfully devirtualized.
@@ -905,7 +906,7 @@ getWitnessMethodSubstitutions(
   auto baseSubMap = conformance->getSubstitutions(mod);
 
   unsigned baseDepth = 0;
-  auto *rootConformance = conformance->getRootNormalConformance();
+  auto *rootConformance = conformance->getRootConformance();
   if (auto *witnessSig = rootConformance->getGenericSignature())
     baseDepth = witnessSig->getGenericParams().back()->getDepth() + 1;
 

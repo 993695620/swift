@@ -168,6 +168,9 @@ public:
 private:
   Demangle::Demangler Dem;
 
+  std::function<const TypeRef* (const void*, unsigned)>
+    OpaqueUnderlyingTypeReader;
+  
   /// Makes sure dynamically allocated TypeRefs stick around for the life of
   /// this TypeRefBuilder and are automatically released.
   std::vector<std::unique_ptr<const TypeRef>> TypeRefPool;
@@ -277,6 +280,38 @@ public:
                          ArrayRef<const TypeRef *> args,
                          const TypeRef *parent) {
     return BoundGenericTypeRef::create(*this, *mangledName, args, parent);
+  }
+  
+  const TypeRef *
+  resolveOpaqueType(NodePointer opaqueDescriptor,
+                    ArrayRef<ArrayRef<const TypeRef *>> genericArgs,
+                    unsigned ordinal) {
+    // TODO: Produce a type ref for the opaque type if the underlying type isn't
+    // available.
+    
+    // Try to resolve to the underlying type, if we can.
+    if (opaqueDescriptor->getKind() ==
+                            Node::Kind::OpaqueTypeDescriptorSymbolicReference) {
+      if (!OpaqueUnderlyingTypeReader)
+        return nullptr;
+      
+      auto underlyingTy = OpaqueUnderlyingTypeReader(
+                           (const void *)opaqueDescriptor->getIndex(), ordinal);
+      
+      if (!underlyingTy)
+        return nullptr;
+      
+      GenericArgumentMap subs;
+      for (unsigned d = 0, de = genericArgs.size(); d < de; ++d) {
+        auto argsForDepth = genericArgs[d];
+        for (unsigned i = 0, ie = argsForDepth.size(); i < ie; ++i) {
+          subs.insert({{d, i}, argsForDepth[i]});
+        }
+      }
+      
+      return underlyingTy->subst(*this, subs);
+    }
+    return nullptr;
   }
 
   const TupleTypeRef *
@@ -474,12 +509,35 @@ public:
       }
       
       switch (kind) {
-      case Demangle::SymbolicReferenceKind::Context:
-        return reader.readDemanglingForContextDescriptor(address, Dem);
+      case Demangle::SymbolicReferenceKind::Context: {
+        auto context = reader.readContextDescriptor(address);
+        if (!context)
+          return nullptr;
+        // Try to preserve a reference to an OpaqueTypeDescriptor symbolically,
+        // since we'd like to read out and resolve the type ref to the
+        // underlying type if available.
+        if (context->getKind() == ContextDescriptorKind::OpaqueType) {
+          return Dem.createNode(
+                              Node::Kind::OpaqueTypeDescriptorSymbolicReference,
+                              (uintptr_t)context.getAddress());
+        }
+          
+        return reader.buildContextMangling(context, Dem);
+      }
+      case Demangle::SymbolicReferenceKind::AccessorFunctionReference:
+        // The symbolic reference points at a resolver function, but we can't
+        // execute code in the target process to resolve it from here.
+        return nullptr;
       }
       
       return nullptr;
     });
+    
+    OpaqueUnderlyingTypeReader =
+    [&reader](const void *descriptor, unsigned ordinal) -> const TypeRef* {
+      auto context = (typename Runtime::StoredPointer)descriptor;
+      return reader.readUnderlyingTypeForOpaqueTypeDescriptor(context, ordinal);
+    };
   }
 
   TypeConverter &getTypeConverter() { return TC; }

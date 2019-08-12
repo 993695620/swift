@@ -18,9 +18,6 @@ let Flags = [FrontendOption, NoDriverOption] in {
 
 def triple : Separate<["-"], "triple">, Alias<target>;
 
-def color_diagnostics : Flag<["-"], "color-diagnostics">,
-  HelpText<"Print diagnostics in color">;
-
 def primary_file : Separate<["-"], "primary-file">,
   HelpText<"Produce output for this file, not the whole module">;
 
@@ -59,13 +56,13 @@ def emit_fixits_path
   : Separate<["-"], "emit-fixits-path">, MetaVarName<"<path>">,
     HelpText<"Output compiler fixits as source edits to <path>">;
 
-// For transition purposes.
-def emit_interface_path
-  : Separate<["-"], "emit-interface-path">,
-    Alias<emit_parseable_module_interface_path>;
+def serialize_module_interface_dependency_hashes
+  : Flag<["-"], "serialize-module-interface-dependency-hashes">,
+    Flags<[HelpHidden]>;
 
 def serialize_parseable_module_interface_dependency_hashes
   : Flag<["-"], "serialize-parseable-module-interface-dependency-hashes">,
+    Alias<serialize_module_interface_dependency_hashes>,
     Flags<[HelpHidden]>;
 
 def tbd_install_name
@@ -124,9 +121,12 @@ def enable_target_os_checking :
 def disable_target_os_checking :
   Flag<["-"], "disable-target-os-checking">,
   HelpText<"Disable checking the target OS of serialized modules">;
-
-def enable_astscope_lookup : Flag<["-"], "enable-astscope-lookup">,
-  HelpText<"Enable ASTScope-based unqualified name lookup">;
+  
+def compare_to_astscope_lookup : Flag<["-"], "compare-to-astscope-lookup">,
+  HelpText<"Compare legacy to ASTScope-based unqualified name lookup (for debugging)">;
+  
+def warn_if_astscope_lookup : Flag<["-"], "warn-if-astscope-lookup">,
+  HelpText<"Print a warning if ASTScope lookup is used">;
 
 def print_clang_stats : Flag<["-"], "print-clang-stats">,
   HelpText<"Print Clang importer statistics">;
@@ -153,8 +153,8 @@ def debug_crash_Group : OptionGroup<"<automatic crashing options>">;
 class DebugCrashOpt : Group<debug_crash_Group>;
 
 
-// Flags that are saved into parseable interfaces
-let Flags = [FrontendOption, NoDriverOption, HelpHidden, ParseableInterfaceOption] in {
+// Flags that are saved into module interfaces
+let Flags = [FrontendOption, NoDriverOption, HelpHidden, ModuleInterfaceOption] in {
 
 def enable_objc_interop :
   Flag<["-"], "enable-objc-interop">,
@@ -188,6 +188,12 @@ def debug_constraints : Flag<["-"], "debug-constraints">,
 
 def debug_constraints_attempt : Separate<["-"], "debug-constraints-attempt">,
   HelpText<"Debug the constraint solver at a given attempt">;
+
+def debug_constraints_on_line : Separate<["-"], "debug-constraints-on-line">,
+  HelpText<"Debug the constraint solver for expressions on <line>">,
+  MetaVarName<"<line>">;
+def debug_constraints_on_line_EQ : Joined<["-"], "debug-constraints-on-line=">,
+  Alias<debug_constraints_on_line>;
 
 def disable_named_lazy_member_loading : Flag<["-"], "disable-named-lazy-member-loading">,
   HelpText<"Disable per-name lazy member loading">;
@@ -228,6 +234,10 @@ def disable_arc_opts : Flag<["-"], "disable-arc-opts">,
 
 def disable_sil_partial_apply : Flag<["-"], "disable-sil-partial-apply">,
   HelpText<"Disable use of partial_apply in SIL generation">;
+
+def enable_ownership_stripping_after_serialization
+  : Flag<["-"], "enable-ownership-stripping-after-serialization">,
+  HelpText<"Strip ownership after serialization">;
 
 def disable_access_control : Flag<["-"], "disable-access-control">,
   HelpText<"Don't respect access control restrictions">;
@@ -350,6 +360,11 @@ def enable_implicit_dynamic : Flag<["-"], "enable-implicit-dynamic">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
   HelpText<"Add 'dynamic' to all declarations">;
 
+def disable_previous_implementation_calls_in_dynamic_replacements :
+  Flag<["-"], "disable-previous-implementation-calls-in-dynamic-replacements">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Disable calling the previous implementation in dynamic replacements">;
+
 def enable_dynamic_replacement_chaining :
   Flag<["-"], "enable-dynamic-replacement-chaining">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
@@ -380,6 +395,9 @@ def warn_long_expression_type_checking : Separate<["-"], "warn-long-expression-t
   HelpText<"Warns when type-checking a function takes longer than <n> ms">;
 def warn_long_expression_type_checking_EQ : Joined<["-"], "warn-long-expression-type-checking=">,
   Alias<warn_long_expression_type_checking>;
+
+def Rmodule_interface_rebuild : Flag<["-"], "Rmodule-interface-rebuild">,
+  HelpText<"Emits a remark if an imported module needs to be re-compiled from its module interface">;
 
 def solver_expression_time_threshold_EQ : Joined<["-"], "solver-expression-time-threshold=">;
 
@@ -432,6 +450,10 @@ def disable_playground_transform : Flag<["-"], "disable-playground-transform">,
 def pc_macro : Flag<["-"], "pc-macro">,
   HelpText<"Apply the 'program counter simulation' macro">;
 
+def no_clang_module_breadcrumbs : Flag<["-"], "no-clang-module-breadcrumbs">,
+  HelpText<"Don't emit DWARF skeleton CUs for imported Clang modules. "
+           "Use this when building a redistributable static archive.">;
+
 def use_jit : Flag<["-"], "use-jit">,
   HelpText<"Register Objective-C classes as if the JIT were in use">;
 
@@ -448,9 +470,6 @@ def sil_inline_caller_benefit_reduction_factor : Separate<["-"], "sil-inline-cal
 def sil_unroll_threshold : Separate<["-"], "sil-unroll-threshold">,
   MetaVarName<"<250>">,
   HelpText<"Controls the aggressiveness of loop unrolling">;
-
-def sil_existential_specializer : Flag<["-"], "sil-existential-specializer">,
-  HelpText<"Enable SIL existential specializer optimization">;
 
 def sil_merge_partial_modules : Flag<["-"], "sil-merge-partial-modules">,
   HelpText<"Merge SIL from all partial swiftmodules into the final module">;
@@ -484,6 +503,11 @@ def emit_sorted_sil : Flag<["-"], "emit-sorted-sil">,
 def emit_syntax : Flag<["-"], "emit-syntax">,
   HelpText<"Parse input file(s) and emit the Syntax tree(s) as JSON">, ModeOpt;
 
+def enable_cxx_interop :
+  Flag<["-"], "enable-cxx-interop">,
+  HelpText<"Enable C++ interop code generation and config directives">,
+  Flags<[FrontendOption, HelpHidden]>;
+
 def use_malloc : Flag<["-"], "use-malloc">,
   HelpText<"Allocate internal data structures using malloc "
            "(for memory debugging)">;
@@ -505,20 +529,27 @@ def dump_interface_hash : Flag<["-"], "dump-interface-hash">,
    HelpText<"Parse input file(s) and dump interface token hash(es)">,
    ModeOpt;
 
-def build_module_from_parseable_interface :
-  Flag<["-"], "build-module-from-parseable-interface">,
+def compile_module_from_interface :
+  Flag<["-"], "compile-module-from-interface">,
   HelpText<"Treat the (single) input as a swiftinterface and produce a module">,
   ModeOpt;
 
+def build_module_from_parseable_interface :
+  Flag<["-"], "build-module-from-parseable-interface">,
+  Alias<compile_module_from_interface>,
+  ModeOpt;
+
+def module_interface_preserve_types_as_written :
+  Flag<["-"], "module-interface-preserve-types-as-written">,
+  HelpText<"When emitting a module interface, preserve types as they were "
+           "written in the source">;
+
 def prebuilt_module_cache_path :
   Separate<["-"], "prebuilt-module-cache-path">,
-  HelpText<"Directory of prebuilt modules for loading parseable interfaces">;
+  HelpText<"Directory of prebuilt modules for loading module interfaces">;
 def prebuilt_module_cache_path_EQ :
   Joined<["-"], "prebuilt-module-cache-path=">,
   Alias<prebuilt_module_cache_path>;
-
-def enable_resilience_bypass : Flag<["-"], "enable-resilience-bypass">,
-   HelpText<"Completely bypass resilience when accessing types in resilient frameworks">;
 
 def force_public_linkage : Flag<["-"], "force-public-linkage">,
    HelpText<"Force public linkage for private symbols. Used by LLDB.">;
@@ -554,9 +585,5 @@ def read_legacy_type_info_path_EQ : Joined<["-"], "read-legacy-type-info-path=">
 def type_info_dump_filter_EQ : Joined<["-"], "type-info-dump-filter=">,
   Flags<[FrontendOption]>,
   HelpText<"One of 'all', 'resilient' or 'fragile'">;
-
-def enable_objc_resilient_class_stubs : Flag<["-"], "enable-resilient-objc-class-stubs">,
-  HelpText<"Emit Objective-C resilient class stubs for classes with "
-           "resiliently-sized metadata">;
 
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

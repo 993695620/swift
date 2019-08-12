@@ -513,6 +513,10 @@ void Remangler::mangleTypeMetadataCompletionFunction(Node *node) {
   mangleSingleChildNode(node); // type
 }
 
+void Remangler::mangleTypeMetadataDemanglingCache(Node *node) {
+  unreachable("not supported");
+}
+
 void Remangler::mangleTypeMetadataLazyCache(Node *node) {
   Buffer << "ML";
   mangleSingleChildNode(node); // type
@@ -715,15 +719,15 @@ void Remangler::mangleBaseWitnessTableAccessor(Node *node) {
 }
 
 void Remangler::mangleReabstractionThunkHelper(Node *node) {
-  Buffer << "TR";
-  if (node->getNumChildren() == 3) Buffer << 'G';
-  mangleChildNodes(node); // generic signature?, type, type
+  Buffer << "<reabstraction-thunk-helper>";
+}
+
+void Remangler::mangleReabstractionThunkHelperWithSelf(Node *node) {
+  Buffer << "<reabstraction-thunk-helper-with-self>";
 }
 
 void Remangler::mangleReabstractionThunk(Node *node) {
-  Buffer << "Tr";
-  if (node->getNumChildren() == 3) Buffer << 'G';
-  mangleChildNodes(node); // generic signature?, type, type
+  Buffer << "<reabstraction-thunk>";
 }
 
 void Remangler::mangleProtocolSelfConformanceWitness(Node *node) {
@@ -1127,6 +1131,11 @@ void Remangler::mangleUncurriedFunctionType(Node *node) {
 void Remangler::mangleObjCBlock(Node *node) {
   Buffer << 'b';
   mangleChildNodes(node); // argument tuple, result type
+}
+
+void Remangler::mangleEscapingObjCBlock(Node *node) {
+  // We shouldn't ever be remangling anything with a DWARF-only mangling.
+  Buffer << "<escaping block type>";
 }
 
 void Remangler::mangleCFunctionPointer(Node *node) {
@@ -1604,6 +1613,10 @@ void Remangler::mangleIndex(Node *node) {
   mangleIndex(node->getIndex());
 }
 
+void Remangler::mangleUnknownIndex(Node *node) {
+  unreachable("should not be reached in an arbitrary context");
+}
+
 void Remangler::mangleProtocol(Node *node, EntityContext &ctx) {
   mangleNominalType(node, 'P', ctx);
 }
@@ -2006,6 +2019,10 @@ void Remangler::mangleProtocolSymbolicReference(Node *node, EntityContext&) {
   unreachable("unsupported");
 }
 
+void Remangler::mangleOpaqueTypeDescriptorSymbolicReference(Node *node) {
+  unreachable("unsupported");
+}
+
 void Remangler::mangleSugaredOptional(Node *node) {
   unreachable("unsupported");
 }
@@ -2020,6 +2037,34 @@ void Remangler::mangleSugaredDictionary(Node *node) {
 
 void Remangler::mangleSugaredParen(Node *node) {
   unreachable("unsupported");
+}
+
+void Remangler::mangleOpaqueReturnType(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueReturnTypeOf(Node *node, EntityContext &ctx) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueType(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptor(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessor(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessorImpl(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessorKey(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleOpaqueTypeDescriptorAccessorVar(Node *node) {
+  unreachable("unsupported");
+}
+void Remangler::mangleAccessorFunctionReference(Node *node) {
+  unreachable("can't remangle");
 }
 
 /// The top-level interface to the remangler.

@@ -79,11 +79,34 @@ extension String {
   ) -> (result: String, repairsMade: Bool) {
     switch validateUTF8(input) {
     case .success(let extraInfo):
-        return (String._uncheckedFromUTF8(
-          input, asciiPreScanResult: extraInfo.isASCII
-        ), false)
+      return (String._uncheckedFromUTF8(
+        input, asciiPreScanResult: extraInfo.isASCII
+      ), false)
     case .error(let initialRange):
         return (repairUTF8(input, firstKnownBrokenRange: initialRange), true)
+    }
+  }
+  
+  internal static func _fromLargeUTF8Repairing(
+    uninitializedCapacity capacity: Int,
+    initializingWith initializer: (
+      _ buffer: UnsafeMutableBufferPointer<UInt8>
+    ) throws -> Int
+  ) rethrows -> String {
+    let result = try __StringStorage.create(
+      uninitializedCapacity: capacity,
+      initializingUncheckedUTF8With: initializer)
+    
+    switch validateUTF8(result.codeUnits) {
+    case .success(let info):
+      result._updateCountAndFlags(
+        newCount: result.count,
+        newIsASCII: info.isASCII
+      )
+      return result.asString
+    case .error(let initialRange):
+      //This could be optimized to use excess tail capacity
+      return repairUTF8(result.codeUnits, firstKnownBrokenRange: initialRange)
     }
   }
 
@@ -144,16 +167,6 @@ extension String {
     return contents.withUnsafeBufferPointer { String._uncheckedFromUTF8($0) }
   }
 
-  internal func _withUnsafeBufferPointerToUTF8<R>(
-    _ body: (UnsafeBufferPointer<UTF8.CodeUnit>) throws -> R
-  ) rethrows -> R {
-    return try self.withUnsafeBytes { rawBufPtr in
-      return try body(UnsafeBufferPointer(
-        start: rawBufPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-        count: rawBufPtr.count))
-    }
-  }
-
   @usableFromInline @inline(never) // slow-path
   internal static func _fromCodeUnits<
     Input: Collection,
@@ -193,8 +206,8 @@ extension String {
   internal static func _fromSubstring(
     _ substring: __shared Substring
   ) -> String {
-    if substring._offsetRange == substring._wholeString._offsetRange {
-      return substring._wholeString
+    if substring._offsetRange == substring.base._offsetRange {
+      return substring.base
     }
 
     return String._copying(substring)
@@ -218,4 +231,3 @@ extension String {
     }
   }
 }
-

@@ -15,7 +15,7 @@
 #include "swift/Basic/StringExtras.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/IDE/Utils.h"
-#include "swift/Index/Utils.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "swift/Migrator/ASTMigratorPass.h"
 #include "swift/Migrator/EditorAdapter.h"
 #include "swift/Migrator/FixitApplyDiagnosticConsumer.h"
@@ -298,8 +298,9 @@ struct APIDiffMigratorPass : public ASTMigratorPass, public SourceEntityWalker {
     };
 
     addDiffItems(VD);
-    for (auto *Overridden: getOverriddenDecls(VD, /*IncludeProtocolReqs=*/true,
-                                              /*Transitive=*/true)) {
+    for (auto *Overridden: collectAllOverriddenDecls(VD,
+                                                     /*IncludeProtocolReqs=*/true,
+                                                     /*Transitive=*/true)) {
       addDiffItems(Overridden);
     }
     return results;
@@ -484,6 +485,9 @@ struct APIDiffMigratorPass : public ASTMigratorPass, public SourceEntityWalker {
   bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
                           TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef,
                           Type T, ReferenceMetaData Data) override {
+    if (Data.isImplicit)
+      return true;
+
     for (auto *Item: getRelatedDiffItems(CtorTyRef ? CtorTyRef: D)) {
       std::string RepText;
       if (isSimpleReplacement(Item, isDotMember(Range), RepText)) {
@@ -501,7 +505,7 @@ struct APIDiffMigratorPass : public ASTMigratorPass, public SourceEntityWalker {
     bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
                             TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef,
                             Type T, ReferenceMetaData Data) override {
-      if (D == Target) {
+      if (D == Target && !Data.isImplicit) {
         Result = Range;
         return false;
       }
@@ -1330,15 +1334,13 @@ struct APIDiffMigratorPass : public ASTMigratorPass, public SourceEntityWalker {
       DiffItem->RightComment, /*From String*/false,
       /*No expression to wrap*/nullptr);
 
-    if (auto *BD = AFD->getBody()) {
-      auto BL = BD->getLBraceLoc();
-      if (BL.isValid()) {
-        // Insert the local variable declaration after the opening brace.
-        Editor.insertAfterToken(BL,
-          (llvm::Twine("\n// Local variable inserted by Swift 4.2 migrator.") +
-           "\nlet " + VariableName + " = " + Info.getFuncName() + "(" +
-           VariableName + ")\n").str());
-      }
+    auto BL = AFD->getBodySourceRange().Start;
+    if (BL.isValid()) {
+      // Insert the local variable declaration after the opening brace.
+      Editor.insertAfterToken(BL,
+        (llvm::Twine("\n// Local variable inserted by Swift 4.2 migrator.") +
+         "\nlet " + VariableName + " = " + Info.getFuncName() + "(" +
+         VariableName + ")\n").str());
     }
   }
 

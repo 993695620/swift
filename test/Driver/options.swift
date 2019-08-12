@@ -27,7 +27,7 @@
 
 // RUN: not %swiftc_driver -import-objc-header fake.h -emit-parseable-module-interface %s 2>&1 | %FileCheck -check-prefix=BRIDGING_HEADER_SWIFTINTERFACE %s
 // RUN: not %swiftc_driver -import-objc-header fake.h -emit-parseable-module-interface-path fake.swiftinterface %s 2>&1 | %FileCheck -check-prefix=BRIDGING_HEADER_SWIFTINTERFACE %s
-// BRIDGING_HEADER_SWIFTINTERFACE: error: using bridging headers with parseable module interfaces is unsupported
+// BRIDGING_HEADER_SWIFTINTERFACE: error: using bridging headers with module interfaces is unsupported
 
 // RUN: %swift_driver -### | %FileCheck -check-prefix=DEFAULT_REPL %s
 // DEFAULT_REPL: -repl
@@ -123,3 +123,13 @@
 // RUN: not %swiftc_driver -gline-tables-only -debug-info-format=codeview %s 2>&1 | %FileCheck -check-prefix BAD_DEBUG_LEVEL_ERROR %s
 // RUN: not %swiftc_driver -gdwarf-types -debug-info-format=codeview %s 2>&1 | %FileCheck -check-prefix BAD_DEBUG_LEVEL_ERROR %s
 // BAD_DEBUG_LEVEL_ERROR: error: argument '-debug-info-format=codeview' is not allowed with '{{.*}}'
+
+// RUN: %swift_driver -F %t/test.framework %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swiftc_driver -F %t/test.framework %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swift_driver -Fsystem %t/test.framework %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swiftc_driver -Fsystem %t/test.framework %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swift_driver -F %t/test.framework/ %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swiftc_driver -F %t/test.framework/ %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swift_driver -Fsystem %t/test.framework/ %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// RUN: %swiftc_driver -Fsystem %t/test.framework/ %s 2>&1 | %FileCheck -check-prefix SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION %s
+// SEARCH_PATH_INCLUDES_FRAMEWORK_EXTENSION: warning: framework search path ends in ".framework"

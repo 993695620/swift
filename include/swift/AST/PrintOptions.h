@@ -135,6 +135,9 @@ struct PrintOptions {
   /// Whether to print *any* accessors on properties.
   bool PrintPropertyAccessors = true;
 
+  /// Whether to print *any* accessors on subscript.
+  bool PrintSubscriptAccessors = true;
+
   /// Whether to print the accessors of a property abstractly,
   /// i.e. always as:
   /// ```
@@ -167,8 +170,15 @@ struct PrintOptions {
   /// Whether to print variable initializers.
   bool VarInitializers = false;
 
+  /// Choices for how to print enum raw values.
+  enum class EnumRawValueMode {
+    Skip,
+    PrintObjCOnly,
+    Print
+  };
+
   /// Whether to print enum raw value expressions.
-  bool EnumRawValues = false;
+  EnumRawValueMode EnumRawValues = EnumRawValueMode::Skip;
 
   /// Whether to prefer printing TypeReprs instead of Types,
   /// if a TypeRepr is available.  This allows us to print the original
@@ -260,6 +270,21 @@ struct PrintOptions {
   /// Whether to skip keywords with a prefix of underscore such as __consuming.
   bool SkipUnderscoredKeywords = false;
 
+  /// How to print opaque return types.
+  enum class OpaqueReturnTypePrintingMode {
+    /// 'some P1 & P2'.
+    WithOpaqueKeyword,
+    /// 'P1 & P2'.
+    WithoutOpaqueKeyword,
+    /// Stable parsable internal syntax.
+    StableReference,
+    /// Description suitable for debugging.
+    Description
+  };
+
+  OpaqueReturnTypePrintingMode OpaqueReturnTypePrinting =
+      OpaqueReturnTypePrintingMode::WithOpaqueKeyword;
+
   /// Whether to print decl attributes that are only used internally,
   /// such as _silgen_name, transparent, etc.
   bool PrintUserInaccessibleAttrs = true;
@@ -273,6 +298,9 @@ struct PrintOptions {
   /// List of attribute kinds that should be printed exclusively.
   /// Empty means allow all.
   std::vector<AnyAttrKind> ExclusiveAttrList;
+
+  /// List of decls that should be printed even if they are implicit and \c SkipImplicit is set to true.
+  std::vector<const Decl*> TreatAsExplicitDeclList;
 
   /// Whether to print function @convention attribute on function types.
   bool PrintFunctionRepresentationAttrs = true;
@@ -324,7 +352,7 @@ struct PrintOptions {
 
   /// Whether to print the doc-comment from the conformance if a member decl
   /// has no associated doc-comment by itself.
-  bool ElevateDocCommentFromConformance = false;
+  bool CascadeDocComment = false;
 
   /// Whether to print the content of an extension decl inside the type decl where it
   /// extends from.
@@ -455,7 +483,7 @@ struct PrintOptions {
     result.SkipDeinit = true;
     result.ExcludeAttrList.push_back(DAK_DiscardableResult);
     result.EmptyLineBetweenMembers = true;
-    result.ElevateDocCommentFromConformance = true;
+    result.CascadeDocComment = true;
     result.ShouldQualifyNestedDeclarations =
         QualifyNestedDeclarations::Always;
     result.PrintDocumentationComments = true;
@@ -469,7 +497,7 @@ struct PrintOptions {
   /// consistent and well-formed.
   ///
   /// \see swift::emitParseableInterface
-  static PrintOptions printParseableInterfaceFile();
+  static PrintOptions printParseableInterfaceFile(bool preferTypeRepr);
 
   static PrintOptions printModuleInterface();
   static PrintOptions printTypeInterface(Type T);
@@ -480,10 +508,10 @@ struct PrintOptions {
 
   void clearSynthesizedExtension();
 
-  bool shouldPrint(const Decl* D) {
+  bool shouldPrint(const Decl* D) const {
     return CurrentPrintabilityChecker->shouldPrint(D, *this);
   }
-  bool shouldPrint(const Pattern* P) {
+  bool shouldPrint(const Pattern* P) const {
     return CurrentPrintabilityChecker->shouldPrint(P, *this);
   }
 
@@ -517,6 +545,8 @@ struct PrintOptions {
     result.PrintInSILBody = true;
     result.PreferTypeRepr = false;
     result.PrintIfConfig = false;
+    result.OpaqueReturnTypePrinting =
+        OpaqueReturnTypePrintingMode::StableReference;
     return result;
   }
 
@@ -545,7 +575,7 @@ struct PrintOptions {
   static PrintOptions printQuickHelpDeclaration() {
     PrintOptions PO;
     PO.SkipUnderscoredKeywords = true;
-    PO.EnumRawValues = true;
+    PO.EnumRawValues = EnumRawValueMode::Print;
     PO.PrintImplicitAttrs = false;
     PO.PrintFunctionRepresentationAttrs = false;
     PO.PrintDocumentationComments = false;
@@ -554,6 +584,7 @@ struct PrintOptions {
     PO.ExplodeEnumCaseDecls = true;
     PO.ShouldQualifyNestedDeclarations = QualifyNestedDeclarations::TypesOnly;
     PO.PrintParameterSpecifiers = true;
+    PO.SkipImplicit = true;
     return PO;
   }
 };

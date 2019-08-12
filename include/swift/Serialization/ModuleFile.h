@@ -57,8 +57,8 @@ class ModuleFile
   /// A reference back to the AST representation of the file.
   FileUnit *FileContext = nullptr;
 
-  /// The module shadowed by this module, if any.
-  ModuleDecl *ShadowedModule = nullptr;
+  /// The module that this module is an overlay of, if any.
+  ModuleDecl *UnderlyingModule = nullptr;
 
   /// The module file data.
   std::unique_ptr<llvm::MemoryBuffer> ModuleInputBuffer;
@@ -388,6 +388,10 @@ private:
   class LocalDeclTableInfo;
   using SerializedLocalDeclTable =
       llvm::OnDiskIterableChainedHashTable<LocalDeclTableInfo>;
+      
+  using OpaqueReturnTypeDeclTableInfo = LocalDeclTableInfo;
+  using SerializedOpaqueReturnTypeDeclTable =
+      llvm::OnDiskIterableChainedHashTable<OpaqueReturnTypeDeclTableInfo>;
 
   class NestedTypeDeclsTableInfo;
   using SerializedNestedTypeDeclsTable =
@@ -408,6 +412,7 @@ private:
   std::unique_ptr<SerializedDeclTable> OperatorMethodDecls;
   std::unique_ptr<SerializedExtensionTable> ExtensionDecls;
   std::unique_ptr<SerializedLocalDeclTable> LocalTypeDecls;
+  std::unique_ptr<SerializedOpaqueReturnTypeDeclTable> OpaqueReturnTypeDecls;
   std::unique_ptr<SerializedNestedTypeDeclsTable> NestedTypeDecls;
   std::unique_ptr<SerializedDeclMemberNamesTable> DeclMemberNames;
 
@@ -697,14 +702,18 @@ public:
     return Dependencies;
   }
 
-  /// The module shadowed by this module, if any.
-  ModuleDecl *getShadowedModule() const { return ShadowedModule; }
+  /// The module that this module is an overlay for, if any.
+  ModuleDecl *getUnderlyingModule() const { return UnderlyingModule; }
 
   /// Searches the module's top-level decls for the given identifier.
   void lookupValue(DeclName name, SmallVectorImpl<ValueDecl*> &results);
 
   /// Searches the module's local type decls for the given mangled name.
   TypeDecl *lookupLocalType(StringRef MangledName);
+      
+  /// Search the module's opaque return type decls for the one corresponding to
+  /// the given mangled name.
+  OpaqueTypeDecl *lookupOpaqueResultType(StringRef MangledName);
 
   /// Searches the module's nested type decls table for the given member of
   /// the given type.
@@ -785,6 +794,9 @@ public:
 
   /// Adds all local type decls to the given vector.
   void getLocalTypeDecls(SmallVectorImpl<TypeDecl*> &Results);
+      
+  /// Add all opaque return type decls in the module to the given vector.
+  void getOpaqueReturnTypeDecls(SmallVectorImpl<OpaqueTypeDecl*> &Results);
 
   /// Adds all top-level decls to the given vector.
   ///
@@ -815,14 +827,18 @@ public:
   loadAllConformances(const Decl *D, uint64_t contextData,
                     SmallVectorImpl<ProtocolConformance*> &Conforms) override;
 
-  virtual TypeLoc loadAssociatedTypeDefault(const AssociatedTypeDecl *ATD,
-                                            uint64_t contextData) override;
+  virtual Type loadAssociatedTypeDefault(const AssociatedTypeDecl *ATD,
+                                         uint64_t contextData) override;
 
   virtual void finishNormalConformance(NormalProtocolConformance *conformance,
                                        uint64_t contextData) override;
 
   GenericEnvironment *loadGenericEnvironment(const DeclContext *decl,
                                              uint64_t contextData) override;
+
+  void
+  loadRequirementSignature(const ProtocolDecl *proto, uint64_t contextData,
+                           SmallVectorImpl<Requirement> &requirements) override;
 
   Optional<StringRef> getGroupNameById(unsigned Id) const;
   Optional<StringRef> getSourceFileNameById(unsigned Id) const;

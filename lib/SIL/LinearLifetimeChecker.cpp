@@ -399,8 +399,8 @@ void State::checkDataflowEndState(DeadEndBlocks &deBlocks) {
     // If we are asked to store any leaking blocks, put them in the leaking
     // blocks array.
     if (leakingBlocks) {
-      copy(successorBlocksThatMustBeVisited,
-           std::back_inserter(*leakingBlocks));
+      llvm::copy(successorBlocksThatMustBeVisited,
+                 std::back_inserter(*leakingBlocks));
     }
 
     // If we are supposed to error on leaks, do so now.
@@ -486,6 +486,26 @@ LinearLifetimeError swift::valueHasLinearLifetime(
   // have been detected by initializing our consuming uses. So we are done.
   if (consumingUses.size() == 1 &&
       consumingUses[0].getParent() == value->getParentBlock()) {
+    // Check if any of our non consuming uses are not in the parent block and
+    // are reachable. We flag those as additional use after frees. Any in the
+    // same block, we would have flagged.
+    if (llvm::any_of(nonConsumingUses, [&](BranchPropagatedUser user) {
+          return user.getParent() != value->getParentBlock() &&
+            !deBlocks.isDeadEnd(user.getParent());
+        })) {
+      state.error.handleUseAfterFree([&] {
+        llvm::errs() << "Function: '" << value->getFunction()->getName()
+                     << "'\n"
+                     << "Found use after free due to unvisited non lifetime "
+                        "ending uses?!\n"
+                     << "Value: " << *value << "    Remaining Users:\n";
+        for (const auto &user : nonConsumingUses) {
+          llvm::errs() << "User: " << *user.getInst();
+        }
+        llvm::errs() << "\n";
+      });
+    }
+
     return state.error;
   }
 

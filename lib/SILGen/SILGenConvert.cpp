@@ -653,7 +653,7 @@ ManagedValue SILGenFunction::emitExistentialErasure(
       if (storedNSErrorConformance->isConcrete()) {
         if (auto normal = dyn_cast<NormalProtocolConformance>(
                                     storedNSErrorConformance->getConcrete())) {
-          if (auto witnessVar = normal->getWitness(nsErrorVar, nullptr)) {
+          if (auto witnessVar = normal->getWitness(nsErrorVar)) {
             nsErrorVar = cast<VarDecl>(witnessVar.getDecl());
             nsErrorVarSubstitutions = witnessVar.getSubstitutions();
           }
@@ -775,8 +775,8 @@ ManagedValue SILGenFunction::emitExistentialErasure(
 
     auto upcast =
       B.createInitExistentialMetatype(loc, metatype,
-                                      existentialTL.getLoweredType(),
-                                      conformances);
+                      existentialTL.getLoweredType(),
+                      conformances);
     return ManagedValue::forUnmanaged(upcast);
   }
   case ExistentialRepresentation::Class: {
@@ -985,6 +985,7 @@ SILGenFunction::emitOpenExistential(
   case ExistentialRepresentation::None:
     llvm_unreachable("not existential");
   }
+  llvm_unreachable("covered switch");
 }
 
 ManagedValue SILGenFunction::manageOpaqueValue(ManagedValue value,

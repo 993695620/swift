@@ -40,52 +40,60 @@
 #include "llvm/Support/TrailingObjects.h"
 
 namespace llvm {
-  struct fltSemantics;
-}
-namespace swift {
-  enum class AllocationArena;
-  class ArchetypeType;
-  class AssociatedTypeDecl;
-  class ASTContext;
-  class ClassDecl;
-  class DependentMemberType;
-  class GenericTypeParamDecl;
-  class GenericTypeParamType;
-  class GenericParamList;
-  class GenericSignature;
-  class Identifier;
-  class InOutType;
-  class OpenedArchetypeType;
-  enum class ReferenceCounting : uint8_t;
-  enum class ResilienceExpansion : unsigned;
-  class SILModule;
-  class SILType;
-  class TypeAliasDecl;
-  class TypeDecl;
-  class NominalTypeDecl;
-  class GenericTypeDecl;
-  class EnumDecl;
-  class EnumElementDecl;
-  class StructDecl;
-  class ProtocolDecl;
-  class TypeVariableType;
-  class ValueDecl;
-  class ModuleDecl;
-  class ModuleType;
-  class ProtocolConformance;
-  enum PointerTypeKind : unsigned;
-  struct ValueOwnershipKind;
+struct fltSemantics;
+} // namespace llvm
 
-  enum class TypeKind : uint8_t {
+namespace swift {
+
+enum class AllocationArena;
+class ArchetypeType;
+class AssociatedTypeDecl;
+class ASTContext;
+class ClassDecl;
+class DependentMemberType;
+class GenericTypeParamDecl;
+class GenericTypeParamType;
+class GenericParamList;
+class GenericSignature;
+class GenericSignatureBuilder;
+class Identifier;
+class InOutType;
+class OpaqueTypeDecl;
+class OpenedArchetypeType;
+enum class ReferenceCounting : uint8_t;
+enum class ResilienceExpansion : unsigned;
+class SILModule;
+class SILType;
+class TypeAliasDecl;
+class TypeDecl;
+class NominalTypeDecl;
+class GenericTypeDecl;
+class EnumDecl;
+class EnumElementDecl;
+class StructDecl;
+class ProtocolDecl;
+class TypeVariableType;
+class ValueDecl;
+class ModuleDecl;
+class ModuleType;
+class ProtocolConformance;
+enum PointerTypeKind : unsigned;
+struct ValueOwnershipKind;
+
+enum class TypeKind : uint8_t {
 #define TYPE(id, parent) id,
 #define LAST_TYPE(id) Last_Type = id,
 #define TYPE_RANGE(Id, FirstId, LastId) \
   First_##Id##Type = FirstId, Last_##Id##Type = LastId,
 #include "swift/AST/TypeNodes.def"
-  };
-  enum : unsigned { NumTypeKindBits =
-    countBitsUsed(static_cast<unsigned>(TypeKind::Last_Type)) };
-  
+};
+
+enum : unsigned {
+  NumTypeKindBits = countBitsUsed(static_cast<unsigned>(TypeKind::Last_Type))
+};
+
+enum class BuiltinTypeKind : std::underlying_type<TypeKind>::type;
+
 /// Various properties of types that are primarily defined recursively
 /// on structural types.
 class RecursiveTypeProperties {
@@ -98,7 +106,8 @@ public:
     /// This type expression contains a TypeVariableType.
     HasTypeVariable      = 0x01,
 
-    /// This type expression contains an ArchetypeType.
+    /// This type expression contains a context-dependent archetype, either a
+    /// PrimaryArchetypeType or OpenedArchetypeType.
     HasArchetype         = 0x02,
 
     /// This type expression contains a GenericTypeParamType.
@@ -125,8 +134,11 @@ public:
 
     /// This type contains a DependentMemberType.
     HasDependentMember   = 0x200,
+    
+    /// This type contains an OpaqueTypeArchetype.
+    HasOpaqueArchetype   = 0x400,
 
-    Last_Property = HasDependentMember
+    Last_Property = HasOpaqueArchetype
   };
   enum { BitWidth = countBitsUsed(Property::Last_Property) };
 
@@ -145,10 +157,14 @@ public:
   /// variable?
   bool hasTypeVariable() const { return Bits & HasTypeVariable; }
 
-  /// Does a type with these properties structurally contain an
-  /// archetype?
+  /// Does a type with these properties structurally contain a
+  /// context-dependent archetype (that is, a Primary- or OpenedArchetype)?
   bool hasArchetype() const { return Bits & HasArchetype; }
 
+  /// Does a type with these properties structurally contain an
+  /// archetype from an opaque type declaration?
+  bool hasOpaqueArchetype() const { return Bits & HasOpaqueArchetype; }
+  
   /// Does a type with these properties have a type parameter somewhere in it?
   bool hasTypeParameter() const { return Bits & HasTypeParameter; }
 
@@ -247,7 +263,9 @@ enum class TypeMatchFlags {
   ///
   /// This is necessary because Objective-C allows optional function paramaters
   /// to be non-escaping, but Swift currently does not.
-  IgnoreNonEscapingForOptionalFunctionParam = 1 << 4
+  IgnoreNonEscapingForOptionalFunctionParam = 1 << 4,
+  /// Allow compatible opaque archetypes.
+  AllowCompatibleOpaqueTypeArchetypes = 1 << 5
 };
 using TypeMatchOptions = OptionSet<TypeMatchFlags>;
 
@@ -324,16 +342,14 @@ protected:
     NumProtocols : 16
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(TypeVariableType, TypeBase, 64-NumTypeBaseBits,
-    /// The unique number assigned to this type variable.
-    ID : 32 - NumTypeBaseBits,
+  SWIFT_INLINE_BITFIELD_FULL(TypeVariableType, TypeBase, 4+32,
+    : NumPadBits,
 
     /// Type variable options.
-    Options : 3,
+    Options : 4,
 
-    ///  Index into the list of type variables, as used by the
-    ///  constraint graph.
-    GraphIndex : 29
+    /// The unique number assigned to this type variable.
+    ID : 32
   );
 
   SWIFT_INLINE_BITFIELD(SILFunctionType, TypeBase, NumSILExtInfoBits+3+1+2,
@@ -445,6 +461,10 @@ public:
   /// types, optionals, etc.
   TypeBase *reconstituteSugar(bool Recursive);
 
+  // If this type is a syntax sugar type, desugar it. Also desugar any nested
+  // syntax sugar types.
+  TypeBase *getWithoutSyntaxSugar();
+
   /// getASTContext - Return the ASTContext that this type belongs to.
   ASTContext &getASTContext() {
     // If this type is canonical, it has the ASTContext in it.
@@ -537,11 +557,11 @@ public:
     return getRecursiveProperties().hasUnresolvedType();
   }
   
-  /// Determine whether the type involves an archetype.
+  /// Determine whether the type involves a context-dependent archetype.
   bool hasArchetype() const {
     return getRecursiveProperties().hasArchetype();
   }
-
+  
   /// Determine whether the type involves an opened existential archetype.
   bool hasOpenedExistential() const {
     return getRecursiveProperties().hasOpenedExistential();
@@ -551,6 +571,11 @@ public:
   /// archetype.
   bool hasOpenedExistential(OpenedArchetypeType *opened);
 
+  /// Determine whether the type involves an opaque type.
+  bool hasOpaqueArchetype() const {
+    return getRecursiveProperties().hasOpaqueArchetype();
+  }
+  
   /// Determine whether the type is an opened existential type.
   ///
   /// To determine whether there is an opened existential type
@@ -567,10 +592,6 @@ public:
   /// Erase the given opened existential type by replacing it with its
   /// existential type throughout the given type.
   Type eraseOpenedExistential(OpenedArchetypeType *opened);
-
-  /// Erase DynamicSelfType from the given type by replacing it with its
-  /// underlying type.
-  Type eraseDynamicSelfType();
 
   /// Given a declaration context, returns a function type with the 'self'
   /// type curried as the input if the declaration context describes a type.
@@ -622,9 +643,13 @@ public:
     return getRecursiveProperties().isLValue();
   }
   
-  /// Is a type with these properties materializable: that is, is it a
-  /// first-class value type?
+  /// Is this a first-class value type, meaning it is not an InOutType or a
+  /// tuple type containing an InOutType?
   bool isMaterializable();
+
+  /// Is this a non-escaping type, that is, a non-escaping function type or a
+  /// tuple type containing a non-escaping type?
+  bool isNoEscape() const;
 
   /// Determine whether the type is dependent on DynamicSelf.
   bool hasDynamicSelfType() const {
@@ -646,11 +671,6 @@ public:
   bool hasDependentMember() const {
     return getRecursiveProperties().hasDependentMember();
   }
-
-  /// Check if this type is a valid type for the LHS of an assignment.
-  /// This mainly means hasLValueType(), but empty tuples and tuples of empty
-  /// tuples also qualify.
-  bool isAssignableType();
 
   /// isExistentialType - Determines whether this type is an existential type,
   /// whose real (runtime) type is unknown but which is known to conform to
@@ -1055,6 +1075,13 @@ public:
              const PrintOptions &PO = PrintOptions()) const;
   void print(ASTPrinter &Printer, const PrintOptions &PO) const;
 
+  /// Can this type be written in source at all?
+  ///
+  /// If not, it shouldn't be shown in fix-its, for instance. The primary
+  /// example is opaque result types, which are written `some P` at the point
+  /// of definition but cannot be uttered anywhere else.
+  bool hasTypeRepr() const;
+
   /// Does this type have grammatically simple syntax?
   bool hasSimpleTypeRepr() const;
 
@@ -1227,6 +1254,19 @@ public:
     return T->getKind() >= TypeKind::First_BuiltinType &&
            T->getKind() <= TypeKind::Last_BuiltinType;
   }
+
+  /// Return the "canonical" name for this builtin. E.x.:
+  ///
+  ///   BuiltinRawPointerType -> BUILTIN_TYPE_NAME_RAWPOINTER ->
+  ///   Builtin.RawPointer.
+  ///
+  /// If \p prependBuiltinNamespace is set to true, "Builtin." is left as a
+  /// prefix on the name. This is the default behavior. If the user asks, we
+  /// strip off the builtin prefix.
+  StringRef getTypeName(SmallVectorImpl<char> &result,
+                        bool prependBuiltinNamespace = true) const;
+
+  BuiltinTypeKind getBuiltinTypeKind() const;
 };
 DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinType, Type)
 
@@ -1719,11 +1759,10 @@ class ParameterTypeFlags {
     None        = 0,
     Variadic    = 1 << 0,
     AutoClosure = 1 << 1,
-    Escaping    = 1 << 2,
-    OwnershipShift = 3,
+    OwnershipShift = 2,
     Ownership   = 7 << OwnershipShift,
 
-    NumBits = 6
+    NumBits = 5
   };
   OptionSet<ParameterFlags> value;
   static_assert(NumBits < 8*sizeof(OptionSet<ParameterFlags>), "overflowed");
@@ -1736,10 +1775,9 @@ public:
     return ParameterTypeFlags(OptionSet<ParameterFlags>(raw));
   }
 
-  ParameterTypeFlags(bool variadic, bool autoclosure, bool escaping,
+  ParameterTypeFlags(bool variadic, bool autoclosure,
                      ValueOwnership ownership)
       : value((variadic ? Variadic : 0) | (autoclosure ? AutoClosure : 0) |
-              (escaping ? Escaping : 0) |
               uint8_t(ownership) << OwnershipShift) {}
 
   /// Create one from what's present in the parameter type
@@ -1750,7 +1788,6 @@ public:
   bool isNone() const { return !value; }
   bool isVariadic() const { return value.contains(Variadic); }
   bool isAutoClosure() const { return value.contains(AutoClosure); }
-  bool isEscaping() const { return value.contains(Escaping); }
   bool isInOut() const { return getValueOwnership() == ValueOwnership::InOut; }
   bool isShared() const { return getValueOwnership() == ValueOwnership::Shared;}
   bool isOwned() const { return getValueOwnership() == ValueOwnership::Owned; }
@@ -1762,11 +1799,6 @@ public:
   ParameterTypeFlags withVariadic(bool variadic) const {
     return ParameterTypeFlags(variadic ? value | ParameterTypeFlags::Variadic
                                        : value - ParameterTypeFlags::Variadic);
-  }
-
-  ParameterTypeFlags withEscaping(bool escaping) const {
-    return ParameterTypeFlags(escaping ? value | ParameterTypeFlags::Escaping
-                                       : value - ParameterTypeFlags::Escaping);
   }
 
   ParameterTypeFlags withInOut(bool isInout) const {
@@ -1861,7 +1893,6 @@ public:
   ParameterTypeFlags asParamFlags() const {
     return ParameterTypeFlags(/*variadic*/ false,
                               /*autoclosure*/ false,
-                              /*escaping*/ false,
                               getValueOwnership());
   }
 
@@ -1932,9 +1963,6 @@ public:
   /// Determine whether this field is an autoclosure parameter closure.
   bool isAutoClosure() const { return Flags.isAutoClosure(); }
 
-  /// Determine whether this field is an escaping parameter closure.
-  bool isEscaping() const { return Flags.isEscaping(); }
-  
   /// Determine whether this field is marked 'inout'.
   bool isInOut() const { return Flags.isInOut(); }
   
@@ -2725,9 +2753,6 @@ public:
     /// Whether the parameter is marked '@autoclosure'
     bool isAutoClosure() const { return Flags.isAutoClosure(); }
     
-    /// Whether the parameter is marked '@escaping'
-    bool isEscaping() const { return Flags.isEscaping(); }
-    
     /// Whether the parameter is marked 'inout'
     bool isInOut() const { return Flags.isInOut(); }
     
@@ -3024,9 +3049,13 @@ public:
   /// replaced.
   AnyFunctionType *withExtInfo(ExtInfo info) const;
 
-  void printParams(raw_ostream &OS,
-                   const PrintOptions &PO = PrintOptions()) const;
-  void printParams(ASTPrinter &Printer, const PrintOptions &PO) const;
+  static void printParams(ArrayRef<Param> Params, raw_ostream &OS,
+                          const PrintOptions &PO = PrintOptions());
+  static void printParams(ArrayRef<Param> Params, ASTPrinter &Printer,
+                          const PrintOptions &PO);
+
+  static std::string getParamListAsString(ArrayRef<Param> Params,
+                                          const PrintOptions &PO = PrintOptions());
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
@@ -3108,12 +3137,32 @@ BEGIN_CAN_TYPE_WRAPPER(FunctionType, AnyFunctionType)
   }
 END_CAN_TYPE_WRAPPER(FunctionType, AnyFunctionType)
 
-/// Map the given parameter list onto a bitvector describing whether
-/// the argument type at each index has a default argument associated with
-/// it.
-SmallBitVector
-computeDefaultMap(ArrayRef<AnyFunctionType::Param> params,
-                  const ValueDecl *paramOwner, bool skipCurriedSelf);
+/// Provides information about the parameter list of a given declaration, including whether each parameter
+/// has a default argument.
+struct ParameterListInfo {
+  SmallBitVector defaultArguments;
+  std::vector<Type> functionBuilderTypes;
+
+public:
+  ParameterListInfo() { }
+
+  ParameterListInfo(ArrayRef<AnyFunctionType::Param> params,
+                    const ValueDecl *paramOwner, bool skipCurriedSelf);
+
+  /// Whether the parameter at the given index has a default argument.
+  bool hasDefaultArgument(unsigned paramIdx) const;
+
+  /// Retrieve the number of non-defaulted parameters.
+  unsigned numNonDefaultedParameters() const {
+    return defaultArguments.count();
+  }
+
+  /// Retrieve the number of parameters for which we have information.
+  unsigned size() const { return defaultArguments.size(); }
+
+  /// Retrieve the function builder type for the given parameter.
+  Type getFunctionBuilderType(unsigned paramIdx) const;
+};
 
 /// Turn a param list into a symbolic and printable representation that does not
 /// include the types, something like (: , b:, c:)
@@ -3167,6 +3216,7 @@ public:
   /// Substitute the given generic arguments into this generic
   /// function type and return the resulting non-generic type.
   FunctionType *substGenericArgs(SubstitutionMap subs);
+  FunctionType *substGenericArgs(llvm::function_ref<Type(Type)> substFn) const;
 
   void Profile(llvm::FoldingSetNodeID &ID) {
     Profile(ID, getGenericSignature(), getParams(), getResult(),
@@ -4087,7 +4137,8 @@ public:
   /// std::error_code. This is only meant to be used in assertions. When
   /// assertions are disabled, this just returns true.
   ABICompatibilityCheckResult
-  isABICompatibleWith(CanSILFunctionType other) const;
+  isABICompatibleWith(CanSILFunctionType other,
+                      SILFunction *context = nullptr) const;
 
   CanSILFunctionType substGenericArgs(SILModule &silModule,
                                       SubstitutionMap subs);
@@ -4554,6 +4605,7 @@ using ArchetypeTrailingObjects = llvm::TrailingObjects<Base,
   ProtocolDecl *, Type, LayoutConstraint, AdditionalTrailingObjects...>;
 
 class PrimaryArchetypeType;
+class OpaqueTypeArchetypeType;
   
 /// An archetype is a type that represents a runtime type that is
 /// known to conform to some set of requirements.
@@ -4683,6 +4735,14 @@ public:
   
   /// Get the generic environment this archetype lives in.
   GenericEnvironment *getGenericEnvironment() const;
+  
+  /// Get the protocol/class existential type that most closely represents the
+  /// set of constraints on this archetype.
+  ///
+  /// Right now, this only considers constraints on the archetype itself, not
+  /// any of its associated types, since those are the only kind of existential
+  /// type we can represent.
+  Type getExistentialType() const;
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
@@ -4739,6 +4799,112 @@ private:
 };
 BEGIN_CAN_TYPE_WRAPPER(PrimaryArchetypeType, ArchetypeType)
 END_CAN_TYPE_WRAPPER(PrimaryArchetypeType, ArchetypeType)
+
+/// An archetype that represents an opaque type.
+class OpaqueTypeArchetypeType final : public ArchetypeType,
+    public llvm::FoldingSetNode,
+    private ArchetypeTrailingObjects<OpaqueTypeArchetypeType>
+{
+  friend TrailingObjects;
+  friend ArchetypeType;
+  friend GenericSignatureBuilder;
+
+  /// The declaration that defines the opaque type.
+  OpaqueTypeDecl *OpaqueDecl;
+  /// The substitutions into the interface signature of the opaque type.
+  SubstitutionMap Substitutions;
+  
+  /// A GenericEnvironment with this opaque archetype bound to the interface
+  /// type of the output type from the OpaqueDecl.
+  GenericEnvironment *Environment;
+  
+public:
+  /// Get 
+  
+  /// Get an opaque archetype representing the underlying type of the given
+  /// opaque type decl.
+  static OpaqueTypeArchetypeType *get(OpaqueTypeDecl *Decl,
+                                      SubstitutionMap Substitutions);
+  
+  OpaqueTypeDecl *getDecl() const {
+    return OpaqueDecl;
+  }
+  SubstitutionMap getSubstitutions() const {
+    return Substitutions;
+  }
+  
+  /// Get the generic signature used to build out this archetype. This is
+  /// equivalent to the OpaqueTypeDecl's interface generic signature, with
+  /// all of the generic parameters aside from the opaque type's interface
+  /// type same-type-constrained to their substitutions for this type.
+  GenericSignature *getBoundSignature() const;
+  
+  /// Get a generic environment that has this opaque archetype bound within it.
+  GenericEnvironment *getGenericEnvironment() const {
+    return Environment;
+  }
+  
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::OpaqueTypeArchetype;
+  }
+  
+  /// Get the ordinal of the type within the declaration's opaque signature.
+  ///
+  /// If a method declared its return type as:
+  ///
+  ///   func foo() -> (some P, some Q)
+  ///
+  /// then the underlying type of `some P` would be ordinal 0, and `some Q` would be ordinal 1.
+  unsigned getOrdinal() const {
+    // TODO: multiple opaque types
+    return 0;
+  }
+  
+  static void Profile(llvm::FoldingSetNodeID &ID,
+                      OpaqueTypeDecl *OpaqueDecl,
+                      SubstitutionMap Substitutions);
+  
+  void Profile(llvm::FoldingSetNodeID &ID) {
+    Profile(ID, getDecl(), getSubstitutions());
+  };
+  
+private:
+  OpaqueTypeArchetypeType(OpaqueTypeDecl *OpaqueDecl,
+                          SubstitutionMap Substitutions,
+                          RecursiveTypeProperties Props,
+                          Type InterfaceType,
+                          ArrayRef<ProtocolDecl*> ConformsTo,
+                          Type Superclass, LayoutConstraint Layout);
+};
+BEGIN_CAN_TYPE_WRAPPER(OpaqueTypeArchetypeType, ArchetypeType)
+END_CAN_TYPE_WRAPPER(OpaqueTypeArchetypeType, ArchetypeType)
+
+/// A function object that can be used as a \c TypeSubstitutionFn and
+/// \c LookupConformanceFn for \c Type::subst style APIs to map opaque
+/// archetypes with underlying types visible at a given resilience expansion
+/// to their underlying types.
+class ReplaceOpaqueTypesWithUnderlyingTypes {
+public:
+  ModuleDecl *contextModule;
+  ResilienceExpansion contextExpansion;
+  ReplaceOpaqueTypesWithUnderlyingTypes(ModuleDecl *contextModule,
+                                        ResilienceExpansion contextExpansion)
+      : contextModule(contextModule), contextExpansion(contextExpansion) {}
+
+  /// TypeSubstitutionFn
+  Type operator()(SubstitutableType *maybeOpaqueType) const;
+
+  /// LookupConformanceFn
+  Optional<ProtocolConformanceRef> operator()(CanType maybeOpaqueType,
+                                              Type replacementType,
+                                              ProtocolDecl *protocol) const;
+
+  bool shouldPerformSubstitution(OpaqueTypeDecl *opaque) const;
+
+  static bool shouldPerformSubstitution(OpaqueTypeDecl *opaque,
+                                        ModuleDecl *contextModule,
+                                        ResilienceExpansion contextExpansion);
+};
 
 /// An archetype that represents the dynamic type of an opened existential.
 class OpenedArchetypeType final : public ArchetypeType,
@@ -4845,6 +5011,9 @@ template<typename Type>
 const Type *ArchetypeType::getSubclassTrailingObjects() const {
   if (auto contextTy = dyn_cast<PrimaryArchetypeType>(this)) {
     return contextTy->getTrailingObjects<Type>();
+  }
+  if (auto opaqueTy = dyn_cast<OpaqueTypeArchetypeType>(this)) {
+    return opaqueTy->getTrailingObjects<Type>();
   }
   if (auto openedTy = dyn_cast<OpenedArchetypeType>(this)) {
     return openedTy->getTrailingObjects<Type>();
@@ -4966,14 +5135,16 @@ public:
   /// Substitute the base type, looking up our associated type in it if it is
   /// non-dependent. Returns null if the member could not be found in the new
   /// base.
-  Type substBaseType(ModuleDecl *M,
-                     Type base,
-                     LazyResolver *resolver = nullptr);
+  Type substBaseType(ModuleDecl *M, Type base);
 
   /// Substitute the base type, looking up our associated type in it if it is
   /// non-dependent. Returns null if the member could not be found in the new
   /// base.
   Type substBaseType(Type base, LookupConformanceFn lookupConformance);
+
+  /// Substitute the root generic type, looking up the chain of associated types.
+  /// Returns null if the member could not be found in the new root.
+  Type substRootParam(Type newRoot, LookupConformanceFn lookupConformance);
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {
@@ -4988,7 +5159,6 @@ BEGIN_CAN_TYPE_WRAPPER(DependentMemberType, Type)
 
   PROXY_CAN_TYPE_SIMPLE_GETTER(getBase)
 END_CAN_TYPE_WRAPPER(DependentMemberType, Type)
-
 
 /// The storage type of a variable with non-strong reference
 /// ownership semantics.
@@ -5072,14 +5242,19 @@ END_CAN_TYPE_WRAPPER(Name##StorageType, ReferenceStorageType)
 #undef REF_STORAGE_HELPER
 
 /// A type variable used during type checking.
-class TypeVariableType : public TypeBase {
+class alignas(1 << TypeVariableAlignInBits)
+TypeVariableType : public TypeBase {
   // Note: We can't use llvm::TrailingObjects here because the trailing object
   // type is opaque.
 
   TypeVariableType(const ASTContext &C, unsigned ID)
     : TypeBase(TypeKind::TypeVariable, &C,
                RecursiveTypeProperties::HasTypeVariable) {
+    // Note: the ID may overflow (current limit is 2^20 - 1).
     Bits.TypeVariableType.ID = ID;
+    if (Bits.TypeVariableType.ID != ID) {
+      llvm::report_fatal_error("Type variable id overflow");
+    }
   }
 
   class Implementation;
@@ -5115,6 +5290,10 @@ public:
     return reinterpret_cast<Implementation *>(this + 1);
   }
 
+  /// Type variable IDs are not globally unique and are
+  /// used in equivalence class merging (so representative
+  /// is always a type variable with smaller id), as well
+  /// as a visual aid when dumping AST.
   unsigned getID() const { return Bits.TypeVariableType.ID; }
 
   // Implement isa/cast/dyncast/etc.
@@ -5371,8 +5550,6 @@ inline ParameterTypeFlags
 ParameterTypeFlags::fromParameterType(Type paramTy, bool isVariadic,
                                       bool isAutoClosure,
                                       ValueOwnership ownership) {
-  bool escaping = paramTy->is<AnyFunctionType>() &&
-                  !paramTy->castTo<AnyFunctionType>()->isNoEscape();
   // FIXME(Remove InOut): The last caller that needs this is argument
   // decomposition.  Start by enabling the assertion there and fixing up those
   // callers, then remove this, then remove
@@ -5382,7 +5559,7 @@ ParameterTypeFlags::fromParameterType(Type paramTy, bool isVariadic,
            ownership == ValueOwnership::InOut);
     ownership = ValueOwnership::InOut;
   }
-  return {isVariadic, isAutoClosure, escaping, ownership};
+  return {isVariadic, isAutoClosure, ownership};
 }
 
 inline const Type *BoundGenericType::getTrailingObjectsPointer() const {
@@ -5453,6 +5630,7 @@ inline bool TypeBase::hasSimpleTypeRepr() const {
   case TypeKind::NestedArchetype:
     return cast<NestedArchetypeType>(this)->getParent()->hasSimpleTypeRepr();
       
+  case TypeKind::OpaqueTypeArchetype:
   case TypeKind::OpenedArchetype:
     return false;
 

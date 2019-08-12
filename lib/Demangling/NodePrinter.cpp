@@ -228,6 +228,13 @@ private:
     Printer << ">";
   }
 
+  void printOptionalIndex(NodePointer node) {
+    assert(node->getKind() == Node::Kind::Index ||
+           node->getKind() == Node::Kind::UnknownIndex);
+    if (node->hasIndex())
+      Printer << "#" << node->getIndex() << " ";
+  }
+
   static bool isSwiftModule(NodePointer node) {
     return (node->getKind() == Node::Kind::Module &&
             node->getText() == STDLIB_NAME);
@@ -315,6 +322,7 @@ private:
       return Node->getChild(0)->getChild(0)->getNumChildren() == 0;
 
     case Node::Kind::ProtocolListWithClass:
+    case Node::Kind::AccessorFunctionReference:
     case Node::Kind::Allocator:
     case Node::Kind::ArgumentTuple:
     case Node::Kind::AssociatedConformanceDescriptor:
@@ -348,6 +356,7 @@ private:
     case Node::Kind::Directness:
     case Node::Kind::DynamicAttribute:
     case Node::Kind::EscapingAutoClosureType:
+    case Node::Kind::EscapingObjCBlock:
     case Node::Kind::NoEscapeFunctionType:
     case Node::Kind::ExplicitClosure:
     case Node::Kind::Extension:
@@ -413,6 +422,11 @@ private:
     case Node::Kind::ObjCBlock:
     case Node::Kind::ObjCMetadataUpdateFunction:
     case Node::Kind::ObjCResilientClassStub:
+    case Node::Kind::OpaqueTypeDescriptor:
+    case Node::Kind::OpaqueTypeDescriptorAccessor:
+    case Node::Kind::OpaqueTypeDescriptorAccessorImpl:
+    case Node::Kind::OpaqueTypeDescriptorAccessorKey:
+    case Node::Kind::OpaqueTypeDescriptorAccessorVar:
     case Node::Kind::Owned:
     case Node::Kind::OwningAddressor:
     case Node::Kind::OwningMutableAddressor:
@@ -435,6 +449,7 @@ private:
     case Node::Kind::ProtocolWitnessTablePattern:
     case Node::Kind::ReabstractionThunk:
     case Node::Kind::ReabstractionThunkHelper:
+    case Node::Kind::ReabstractionThunkHelperWithSelf:
     case Node::Kind::ReadAccessor:
     case Node::Kind::RelatedEntityDeclName:
     case Node::Kind::RetroactiveConformance:
@@ -457,11 +472,13 @@ private:
     case Node::Kind::TypeMetadataInstantiationCache:
     case Node::Kind::TypeMetadataInstantiationFunction:
     case Node::Kind::TypeMetadataSingletonInitializationCache:
+    case Node::Kind::TypeMetadataDemanglingCache:
     case Node::Kind::TypeMetadataLazyCache:
     case Node::Kind::UncurriedFunctionType:
 #define REF_STORAGE(Name, ...) \
     case Node::Kind::Name:
 #include "swift/AST/ReferenceStorage.def"
+    case Node::Kind::UnknownIndex:
     case Node::Kind::UnsafeAddressor:
     case Node::Kind::UnsafeMutableAddressor:
     case Node::Kind::ValueWitness:
@@ -509,6 +526,10 @@ private:
     case Node::Kind::DynamicallyReplaceableFunctionKey:
     case Node::Kind::DynamicallyReplaceableFunctionImpl:
     case Node::Kind::DynamicallyReplaceableFunctionVar:
+    case Node::Kind::OpaqueType:
+    case Node::Kind::OpaqueTypeDescriptorSymbolicReference:
+    case Node::Kind::OpaqueReturnType:
+    case Node::Kind::OpaqueReturnTypeOf:
       return false;
     }
     printer_unreachable("bad node kind");
@@ -1162,6 +1183,9 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   case Node::Kind::Index:
     Printer << Node->getIndex();
     return nullptr;
+  case Node::Kind::UnknownIndex:
+    Printer << "unknown index";
+    return nullptr;
   case Node::Kind::NoEscapeFunctionType:
     printFunctionType(nullptr, Node);
     return nullptr;
@@ -1536,22 +1560,40 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   case Node::Kind::ReabstractionThunkHelper: {
     if (Options.ShortenThunk) {
       Printer << "thunk for ";
-      print(Node->getChild(Node->getNumChildren() - 2));
+      print(Node->getChild(Node->getNumChildren() - 1));
       return nullptr;
     }
     Printer << "reabstraction thunk ";
     if (Node->getKind() == Node::Kind::ReabstractionThunkHelper)
       Printer << "helper ";
-    auto generics = getFirstChildOfKind(Node, Node::Kind::DependentGenericSignature);
-    assert(Node->getNumChildren() == 2 + unsigned(generics != nullptr));
-    if (generics) {
+    unsigned idx = 0;
+    if (Node->getNumChildren() == 3) {
+      auto generics = Node->getChild(0);
+      idx = 1;
       print(generics);
       Printer << " ";
     }
     Printer << "from ";
-    print(Node->getChild(Node->getNumChildren() - 2));
+    print(Node->getChild(idx + 1));
     Printer << " to ";
-    print(Node->getChild(Node->getNumChildren() - 1));
+    print(Node->getChild(idx));
+    return nullptr;
+  }
+  case Node::Kind::ReabstractionThunkHelperWithSelf: {
+    Printer << "reabstraction thunk ";
+    unsigned idx = 0;
+    if (Node->getNumChildren() == 4) {
+      auto generics = Node->getChild(0);
+      idx = 1;
+      print(generics);
+      Printer << " ";
+    }
+    Printer << "from ";
+    print(Node->getChild(idx + 2));
+    Printer << " to ";
+    print(Node->getChild(idx + 1));
+    Printer << " self ";
+    print(Node->getChild(idx));
     return nullptr;
   }
   case Node::Kind::MergedFunction:
@@ -1561,6 +1603,10 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     return nullptr;
   case Node::Kind::TypeSymbolicReference:
     Printer << "type symbolic reference 0x";
+    Printer.writeHex(Node->getIndex());
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorSymbolicReference:
+    Printer << "opaque type symbolic reference 0x";
     Printer.writeHex(Node->getIndex());
     return nullptr;
   case Node::Kind::DynamicallyReplaceableFunctionKey:
@@ -1634,6 +1680,10 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     Printer << "type metadata completion function for ";
     print(Node->getChild(0));
     return nullptr;
+  case Node::Kind::TypeMetadataDemanglingCache:
+    Printer << "demangling cache variable for type metadata for ";
+    print(Node->getChild(0));
+    return nullptr;
   case Node::Kind::TypeMetadataLazyCache:
     Printer << "lazy cache variable for type metadata for ";
     print(Node->getChild(0));
@@ -1700,6 +1750,26 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     Printer << "nominal type descriptor for ";
     print(Node->getChild(0));
     return nullptr;
+  case Node::Kind::OpaqueTypeDescriptor:
+    Printer << "opaque type descriptor for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessor:
+    Printer << "opaque type descriptor accessor for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessorImpl:
+    Printer << "opaque type descriptor accessor impl for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessorKey:
+    Printer << "opaque type descriptor accessor key for ";
+    print(Node->getChild(0));
+    return nullptr;
+  case Node::Kind::OpaqueTypeDescriptorAccessorVar:
+    Printer << "opaque type descriptor accessor var for ";
+    print(Node->getChild(0));
+    return nullptr;
   case Node::Kind::CoroutineContinuationPrototype:
     Printer << "coroutine continuation prototype for ";
     print(Node->getChild(0));
@@ -1732,6 +1802,11 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
   }
   case Node::Kind::ObjCBlock: {
     Printer << "@convention(block) ";
+    printFunctionType(nullptr, Node);
+    return nullptr;
+  }
+  case Node::Kind::EscapingObjCBlock: {
+    Printer << "@escaping @convention(block) ";
     printFunctionType(nullptr, Node);
     return nullptr;
   }
@@ -2178,20 +2253,21 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     return nullptr;
   case Node::Kind::DependentProtocolConformanceAssociated:
     Printer << "dependent associated protocol conformance ";
-    if (Node->hasIndex())
-      Printer << "#" << Node->getIndex() << " ";
-    printChildren(Node);
+    printOptionalIndex(Node->getChild(2));
+    print(Node->getChild(0));
+    print(Node->getChild(1));
     return nullptr;
   case Node::Kind::DependentProtocolConformanceInherited:
     Printer << "dependent inherited protocol conformance ";
-    if (Node->hasIndex())
-      Printer << "#" << Node->getIndex() << " ";
-    printChildren(Node);
+    printOptionalIndex(Node->getChild(2));
+    print(Node->getChild(0));
+    print(Node->getChild(1));
     return nullptr;
   case Node::Kind::DependentProtocolConformanceRoot:
-    Printer << "dependent root protocol conformance #" << Node->getIndex()
-      << " ";
-    printChildren(Node);
+    Printer << "dependent root protocol conformance ";
+    printOptionalIndex(Node->getChild(2));
+    print(Node->getChild(0));
+    print(Node->getChild(1));
     return nullptr;
   case Node::Kind::ProtocolConformanceRefInTypeModule:
     Printer << "protocol conformance ref (type's module) ";
@@ -2225,6 +2301,22 @@ NodePointer NodePrinter::print(NodePointer Node, bool asPrefixContext) {
     Printer << "(";
     print(Node->getChild(0));
     Printer << ")";
+    return nullptr;
+  case Node::Kind::OpaqueReturnType:
+    Printer << "some";
+    return nullptr;
+  case Node::Kind::OpaqueReturnTypeOf:
+    Printer << "<<opaque return type of ";
+    printChildren(Node);
+    Printer << ">>";
+    return nullptr;
+  case Node::Kind::OpaqueType:
+    print(Node->getChild(0));
+    Printer << '.';
+    print(Node->getChild(1));
+    return nullptr;
+  case Node::Kind::AccessorFunctionReference:
+    Printer << "accessor function at " << Node->getIndex();
     return nullptr;
   }
   printer_unreachable("bad node kind!");

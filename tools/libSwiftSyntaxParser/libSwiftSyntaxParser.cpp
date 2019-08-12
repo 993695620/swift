@@ -155,6 +155,7 @@ private:
     node.present = true;
   }
 
+public:
   OpaqueSyntaxNode recordToken(tok tokenKind,
                                ArrayRef<ParsedTriviaPiece> leadingTrivia,
                                ArrayRef<ParsedTriviaPiece> trailingTrivia,
@@ -201,6 +202,10 @@ private:
     auto result = NodeLookup(lexerOffset, ckind);
     return {result.length, result.node};
   }
+
+  OpaqueSyntaxNodeKind getOpaqueKind() override {
+    return OpaqueSyntaxNodeKind::SwiftSyntax;
+  }
 };
 
 static swiftparser_diagnostic_severity_t getSeverity(DiagnosticKind Kind) {
@@ -229,11 +234,12 @@ struct SynParserDiagConsumer: public DiagnosticConsumer {
   const unsigned BufferID;
   SynParserDiagConsumer(SynParser &Parser, unsigned BufferID):
     Parser(Parser), BufferID(BufferID) {}
-  void handleDiagnostic(SourceManager &SM, SourceLoc Loc,
-                        DiagnosticKind Kind,
-                        StringRef FormatString,
-                        ArrayRef<DiagnosticArgument> FormatArgs,
-                        const DiagnosticInfo &Info) override {
+  void
+  handleDiagnostic(SourceManager &SM, SourceLoc Loc, DiagnosticKind Kind,
+                   StringRef FormatString,
+                   ArrayRef<DiagnosticArgument> FormatArgs,
+                   const DiagnosticInfo &Info,
+                   const SourceLoc bufferIndirectlyCausingDiagnostic) override {
     assert(Kind != DiagnosticKind::Remark && "Shouldn't see this in parser.");
     // The buffer where all char* will point into.
     llvm::SmallString<256> Buffer;
@@ -275,7 +281,8 @@ swiftparse_client_node_t SynParser::parse(const char *source) {
   langOpts.BuildSyntaxTree = true;
   langOpts.CollectParsedToken = false;
   // Disable name lookups during parsing.
-  langOpts.EnableASTScopeLookup = true;
+  // Not ready yet:
+  // langOpts.EnableASTScopeLookup = true;
 
   auto parseActions =
     std::make_shared<CLibParseActions>(*this, SM, bufID);

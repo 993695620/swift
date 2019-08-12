@@ -615,7 +615,8 @@ swift_conformsToProtocolImpl(const Metadata * const type,
   if (!description)
     return nullptr;
 
-  return description->getWitnessTable(type);
+  return description->getWitnessTable(
+      findConformingSuperclass(type, description));
 }
 
 const ContextDescriptor *
@@ -633,6 +634,22 @@ swift::_searchConformancesByMangledTypeName(Demangle::NodePointer node) {
   return nullptr;
 }
 
+void
+swift::_forEachProtocolConformanceSectionAfter(
+  size_t *start, 
+  const std::function<void(const ProtocolConformanceRecord *,
+                           const ProtocolConformanceRecord *)> &f) {
+  auto snapshot = Conformances.get().SectionsToScan.snapshot();
+  if (snapshot.Count > *start) {
+    auto *begin = snapshot.begin() + *start;
+    auto *end = snapshot.end();
+    for (auto *section = begin; section != end; section++) {
+      f(section->Begin, section->End);
+    }
+    *start = snapshot.Count;
+  }
+}
+
 bool swift::_checkGenericRequirements(
                       llvm::ArrayRef<GenericRequirementDescriptor> requirements,
                       SmallVectorImpl<const void *> &extraArguments,
@@ -645,8 +662,9 @@ bool swift::_checkGenericRequirements(
     // Resolve the subject generic parameter.
     const Metadata *subjectType =
       swift_getTypeByMangledName(MetadataState::Abstract,
-                                 req.getParam(), substGenericParam,
-                                 substWitnessTable).getMetadata();
+                                 req.getParam(),
+                                 extraArguments.data(),
+                                 substGenericParam, substWitnessTable).getMetadata();
     if (!subjectType)
       return true;
 
@@ -671,8 +689,9 @@ bool swift::_checkGenericRequirements(
       // Demangle the second type under the given substitutions.
       auto otherType =
         swift_getTypeByMangledName(MetadataState::Abstract,
-                                   req.getMangledTypeName(), substGenericParam,
-                                   substWitnessTable).getMetadata();
+                                   req.getMangledTypeName(),
+                                   extraArguments.data(),
+                                   substGenericParam, substWitnessTable).getMetadata();
       if (!otherType) return true;
 
       assert(!req.getFlags().hasExtraArgument());
@@ -699,8 +718,9 @@ bool swift::_checkGenericRequirements(
       // Demangle the base type under the given substitutions.
       auto baseType =
         swift_getTypeByMangledName(MetadataState::Abstract,
-                                   req.getMangledTypeName(), substGenericParam,
-                                   substWitnessTable).getMetadata();
+                                   req.getMangledTypeName(),
+                                   extraArguments.data(),
+                                   substGenericParam, substWitnessTable).getMetadata();
       if (!baseType) return true;
 
       // Check whether it's dynamically castable, which works as a superclass

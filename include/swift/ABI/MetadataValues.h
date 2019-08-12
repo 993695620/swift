@@ -1102,6 +1102,9 @@ enum class ContextDescriptorKind : uint8_t {
 
   /// This context descriptor represents a protocol context.
   Protocol = 3,
+  
+  /// This context descriptor represents an opaque type alias.
+  OpaqueType = 4,
 
   /// First kind that represents a type of any sort.
   Type_First = 16,
@@ -1749,4 +1752,4 @@ public:
 
 } // end namespace swift
 
-#endif /* SWIFT_ABI_METADATAVALUES_H */
+#endif // SWIFT_ABI_METADATAVALUES_H

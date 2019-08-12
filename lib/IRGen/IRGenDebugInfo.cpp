@@ -148,6 +148,9 @@ public:
 
   void setCurrentLoc(IRBuilder &Builder, const SILDebugScope *DS,
                      SILLocation Loc);
+
+  void addFailureMessageToCurrentLoc(IRBuilder &Builder, StringRef failureMsg);
+
   void clearLoc(IRBuilder &Builder);
   void pushLoc();
   void popLoc();
@@ -191,14 +194,13 @@ public:
 
 private:
   static StringRef getFilenameFromDC(const DeclContext *DC) {
-    if (auto LF = dyn_cast<LoadedFile>(DC))
+    if (auto *LF = dyn_cast<LoadedFile>(DC))
       return LF->getFilename();
-    if (auto SF = dyn_cast<SourceFile>(DC))
+    if (auto *SF = dyn_cast<SourceFile>(DC))
       return SF->getFilename();
-    else if (auto M = dyn_cast<ModuleDecl>(DC))
+    if (auto *M = dyn_cast<ModuleDecl>(DC))
       return M->getModuleFilename();
-    else
-      return StringRef();
+    return {};
   }
 
   using DebugLoc = SILLocation::DebugLoc;
@@ -637,22 +639,28 @@ private:
     if (Val != DIModuleCache.end())
       return cast<llvm::DIModule>(Val->second);
 
+    std::string RemappedIncludePath = DebugPrefixMap.remapPath(IncludePath);
+
     // For Clang modules / PCH, create a Skeleton CU pointing to the PCM/PCH.
-    bool CreateSkeletonCU = !ASTFile.empty();
-    bool IsRootModule = !Parent;
-    if (CreateSkeletonCU && IsRootModule) {
-      llvm::DIBuilder DIB(M);
-      DIB.createCompileUnit(IGM.ObjCInterop ? llvm::dwarf::DW_LANG_ObjC
-                                            : llvm::dwarf::DW_LANG_C99,
-                            DIB.createFile(Name, IncludePath),
-                            TheCU->getProducer(), true, StringRef(), 0, ASTFile,
-                            llvm::DICompileUnit::FullDebug, Signature);
-      DIB.finalize();
+    if (!Opts.DisableClangModuleSkeletonCUs) {
+      bool CreateSkeletonCU = !ASTFile.empty();
+      bool IsRootModule = !Parent;
+      if (CreateSkeletonCU && IsRootModule) {
+        llvm::DIBuilder DIB(M);
+        DIB.createCompileUnit(IGM.ObjCInterop ? llvm::dwarf::DW_LANG_ObjC
+                                              : llvm::dwarf::DW_LANG_C99,
+                              DIB.createFile(Name, RemappedIncludePath),
+                              TheCU->getProducer(), true, StringRef(), 0,
+                              ASTFile, llvm::DICompileUnit::FullDebug,
+                              Signature);
+        DIB.finalize();
+      }
     }
 
     StringRef Sysroot = IGM.Context.SearchPathOpts.SDKPath;
     llvm::DIModule *M =
-        DBuilder.createModule(Parent, Name, ConfigMacros, IncludePath, Sysroot);
+        DBuilder.createModule(Parent, Name, ConfigMacros, RemappedIncludePath,
+                              Sysroot);
     DIModuleCache.insert({Key, llvm::TrackingMDNodeRef(M)});
     return M;
   }
@@ -711,7 +719,6 @@ private:
     ModuleDecl *M = IM.second;
     if (Optional<ASTSourceDescriptor> ModuleDesc = getClangModule(*M))
       return getOrCreateModule(*ModuleDesc, ModuleDesc->getModuleOrNull());
-
     StringRef Path = getFilenameFromDC(M);
     StringRef Name = M->getName().str();
     return getOrCreateModule(M, TheCU, Name, Path);
@@ -757,28 +764,6 @@ private:
     return Size(size);
   }
 
-#ifndef NDEBUG
-  static bool areTypesReallyEqual(Type lhs, Type rhs) {
-    // Due to an oversight, escaping and non-escaping @convention(block)
-    // are mangled identically.
-    auto eraseEscapingBlock = [](Type t) -> Type {
-      return t.transform([](Type t) -> Type {
-        if (auto *fnType = t->getAs<FunctionType>()) {
-          if (fnType->getExtInfo().getRepresentation()
-                == FunctionTypeRepresentation::Block) {
-            return FunctionType::get(fnType->getParams(),
-                                    fnType->getResult(),
-                                    fnType->getExtInfo().withNoEscape(true));
-          }
-        }
-        return t;
-      });
-    };
-
-    return eraseEscapingBlock(lhs)->isEqual(eraseEscapingBlock(rhs));
-  }
-#endif
-
   StringRef getMangledName(DebugTypeInfo DbgTy) {
     if (DbgTy.IsMetadataType)
       return MetadataTypeDeclCache.find(DbgTy.getDecl()->getName().str())
@@ -808,7 +793,9 @@ private:
     std::string Result = Mangler.mangleTypeForDebugger(
         Ty, nullptr);
 
-    if (!Opts.DisableRoundTripDebugTypes) {
+    if (!Opts.DisableRoundTripDebugTypes
+        // FIXME: implement type reconstruction for opaque types
+        && !Ty->hasOpaqueArchetype()) {
       // Make sure we can reconstruct mangled types for the debugger.
 #ifndef NDEBUG
       auto &Ctx = Ty->getASTContext();
@@ -819,14 +806,12 @@ private:
         Ty->dump();
         abort();
       } else if (!Reconstructed->isEqual(Ty)) {
-        if (!areTypesReallyEqual(Reconstructed, Ty)) {
-          llvm::errs() << "Incorrect reconstructed type for " << Result << "\n";
-          llvm::errs() << "Original type:\n";
-          Ty->dump();
-          llvm::errs() << "Reconstructed type:\n";
-          Reconstructed->dump();
-          abort();
-        }
+        llvm::errs() << "Incorrect reconstructed type for " << Result << "\n";
+        llvm::errs() << "Original type:\n";
+        Ty->dump();
+        llvm::errs() << "Reconstructed type:\n";
+        Reconstructed->dump();
+        abort();
       }
 #endif
     }
@@ -1361,6 +1346,7 @@ private:
     case TypeKind::InOut:
       break;
 
+    case TypeKind::OpaqueTypeArchetype:
     case TypeKind::PrimaryArchetype:
     case TypeKind::OpenedArchetype:
     case TypeKind::NestedArchetype: {
@@ -1845,7 +1831,37 @@ void IRGenDebugInfoImpl::setCurrentLoc(IRBuilder &Builder,
   auto DL = llvm::DebugLoc::get(L.Line, L.Column, Scope, InlinedAt);
   Builder.SetCurrentDebugLocation(DL);
 }
+  
+void IRGenDebugInfoImpl::addFailureMessageToCurrentLoc(IRBuilder &Builder,
+                                                       StringRef failureMsg) {
+  auto TrapLoc = Builder.getCurrentDebugLocation();
 
+  // Create a function in the debug info which has failureMsg as name.
+  // TrapSc is the SIL debug scope which corresponds to TrapSP in the LLVM debug
+  // info.
+  RegularLocation ALoc = RegularLocation::getAutoGeneratedLocation();
+  const SILDebugScope *TrapSc = new (IGM.getSILModule()) SILDebugScope(ALoc);
+
+  llvm::DISubroutineType *DIFnTy = DBuilder.createSubroutineType(nullptr);
+
+  std::string FuncName = "Swift runtime failure: ";
+  FuncName += failureMsg;
+
+  llvm::DISubprogram *TrapSP = DBuilder.createFunction(
+     MainModule, StringRef(), FuncName, TrapLoc->getFile(), 0, DIFnTy, 0,
+     llvm::DINode::FlagArtificial, llvm::DISubprogram::SPFlagDefinition,
+     nullptr, nullptr, nullptr);
+
+  ScopeCache[TrapSc] = llvm::TrackingMDNodeRef(TrapSP);
+  LastScope = TrapSc;
+  
+  assert(parentScopesAreSane(TrapSc) && "parent scope sanity check failed");
+  
+  // Wrap the existing TrapLoc into the failure function.
+  auto DL = llvm::DebugLoc::get(0, 0, TrapSP, TrapLoc);
+  Builder.SetCurrentDebugLocation(DL);
+}
+  
 void IRGenDebugInfoImpl::clearLoc(IRBuilder &Builder) {
   LastDebugLoc = {};
   LastScope = nullptr;
@@ -1872,10 +1888,21 @@ void IRGenDebugInfoImpl::setInlinedTrapLocation(IRBuilder &Builder,
                                                 const SILDebugScope *Scope) {
   if (Opts.DebugInfoFormat != IRGenDebugInfoFormat::CodeView)
     return;
-  auto DLInlinedAt = llvm::DebugLoc::get(LastDebugLoc.Line, LastDebugLoc.Column,
-                                         getOrCreateScope(LastScope));
+
+  // The @llvm.trap could be inlined into a chunk of code that was also inlined.
+  // If this is the case then simply using the LastScope's location would
+  // generate debug info that claimed Function A owned Block X and Block X
+  // thought it was owned by Function B. Therefore, we need to find the last
+  // inlined scope to point to.
+  const SILDebugScope *TheLastScope = LastScope;
+  while (TheLastScope->InlinedCallSite &&
+         TheLastScope->InlinedCallSite != TheLastScope) {
+    TheLastScope = TheLastScope->InlinedCallSite;
+  }
+  auto LastLocation = llvm::DebugLoc::get(
+      LastDebugLoc.Line, LastDebugLoc.Column, getOrCreateScope(TheLastScope));
   // FIXME: This location should point to stdlib instead of being artificial.
-  auto DL = llvm::DebugLoc::get(0, 0, getOrCreateScope(Scope), DLInlinedAt);
+  auto DL = llvm::DebugLoc::get(0, 0, getOrCreateScope(Scope), LastLocation);
   Builder.SetCurrentDebugLocation(DL);
 }
 
@@ -2114,10 +2141,6 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
     IRBuilder &Builder, ArrayRef<llvm::Value *> Storage, DebugTypeInfo DbgTy,
     const SILDebugScope *DS, ValueDecl *VarDecl, StringRef Name, unsigned ArgNo,
     IndirectionKind Indirection, ArtificialKind Artificial) {
-  // Self is always an artificial argument.
-  if (ArgNo > 0 && Name == IGM.Context.Id_self.str())
-    Artificial = ArtificialValue;
-
   // FIXME: Make this an assertion.
   // assert(DS && "variable has no scope");
   if (!DS)
@@ -2149,10 +2172,15 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
   assert(DITy && "could not determine debug type of variable");
 
   unsigned Line = Loc.Line;
+
+  // Self is always an artificial argument, so are variables without location.
+  if (!Line || (ArgNo > 0 && Name == IGM.Context.Id_self.str()))
+    Artificial = ArtificialValue;
+
   llvm::DINode::DIFlags Flags = llvm::DINode::FlagZero;
   if (Artificial || DITy->isArtificial() || DITy == InternalType)
     Flags |= llvm::DINode::FlagArtificial;
-
+  
   // This could be Opts.Optimize if we would also unique DIVariables here.
   bool Optimized = false;
   // Create the descriptor for the variable.
@@ -2173,11 +2201,6 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
     SmallVector<uint64_t, 3> Operands;
     if (Indirection)
       Operands.push_back(llvm::dwarf::DW_OP_deref);
-
-    // There are variables without storage, such as "struct { func foo() {}
-    // }". Emit them as constant 0.
-    if (isa<llvm::UndefValue>(Piece))
-      Piece = llvm::ConstantInt::get(IGM.Int64Ty, 0);
 
     if (IsPiece) {
       // Advance the offset and align it for the next piece.
@@ -2328,6 +2351,12 @@ void IRGenDebugInfo::finalize() {
 void IRGenDebugInfo::setCurrentLoc(IRBuilder &Builder, const SILDebugScope *DS,
                                    SILLocation Loc) {
   static_cast<IRGenDebugInfoImpl *>(this)->setCurrentLoc(Builder, DS, Loc);
+}
+
+void IRGenDebugInfo::addFailureMessageToCurrentLoc(IRBuilder &Builder,
+                                                   StringRef failureMsg) {
+  static_cast<IRGenDebugInfoImpl *>(this)->
+    addFailureMessageToCurrentLoc(Builder, failureMsg);
 }
 
 void IRGenDebugInfo::clearLoc(IRBuilder &Builder) {
