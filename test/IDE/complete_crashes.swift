@@ -355,8 +355,8 @@ extension Foo {
 }
 #endif
 // RDAR_41234606: Begin completion
-// RDAR_41234606-DAG: Decl[AssociatedType]/Super:         .Element; name=Element
-// RDAR_41234606-DAG: Decl[AssociatedType]/Super:         .Iterator; name=Iterator
+// RDAR_41234606-DAG: Decl[AssociatedType]/CurrNominal:         .Element; name=Element
+// RDAR_41234606-DAG: Decl[AssociatedType]/CurrNominal:         .Iterator; name=Iterator
 // RDAR_41234606: End completions
 
 // rdar://problem/41071587
@@ -368,3 +368,13 @@ func test_41071587(x: Any) {
   }
 }
 // RDAR_41071587: Begin completions
+
+// rdar://problem/54215016
+// RUN: %target-swift-ide-test -code-completion -code-completion-token=RDAR_54215016 -source-filename=%s | %FileCheck %s -check-prefix=RDAR_54215016
+struct test_54215016 {
+  func genericError<Value>()
+  func test() {
+    genericError(#^RDAR_54215016^#)
+// RDAR_54215016: Begin completions
+  }
+}

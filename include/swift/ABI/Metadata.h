@@ -998,8 +998,6 @@ struct TargetClassMetadata : public TargetAnyClassMetadata<Runtime> {
   using StoredPointer = typename Runtime::StoredPointer;
   using StoredSize = typename Runtime::StoredSize;
 
-  friend class ReflectionContext;
-
   TargetClassMetadata() = default;
   constexpr TargetClassMetadata(const TargetAnyClassMetadata<Runtime> &base,
              ClassFlags flags,
@@ -2338,6 +2336,12 @@ public:
   
   const TargetContextDescriptor<Runtime> *getTypeDescriptor() const {
     return TypeRef.getTypeDescriptor(getTypeKind());
+  }
+
+  const TargetContextDescriptor<Runtime> **_getTypeDescriptorLocation() const {
+    if (getTypeKind() != TypeReferenceKind::IndirectTypeDescriptor)
+      return nullptr;
+    return TypeRef.IndirectTypeDescriptor.get();
   }
 
   /// Retrieve the context of a retroactive conformance.

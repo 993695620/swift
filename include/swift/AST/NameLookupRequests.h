@@ -19,14 +19,26 @@
 #include "swift/AST/SimpleRequest.h"
 #include "swift/AST/ASTTypeIDs.h"
 #include "swift/Basic/Statistic.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/TinyPtrVector.h"
 
 namespace swift {
 
 class ClassDecl;
+class DeclContext;
+class DeclName;
 class DestructorDecl;
+class GenericContext;
+class GenericParamList;
+class LookupResult;
+class SourceLoc;
 class TypeAliasDecl;
 class TypeDecl;
+enum class UnqualifiedLookupFlags;
+namespace ast_scope {
+class ASTScopeImpl;
+class ScopeCreator;
+} // namespace ast_scope
 
 /// Display a nominal type or extension thereof.
 void simple_display(
@@ -62,10 +74,6 @@ class InheritedDeclsReferencedRequest :
                          unsigned),
                        CacheKind::Uncached> // FIXME: Cache these
 {
-  /// Retrieve the TypeLoc for this inherited type.
-  TypeLoc &getTypeLoc(llvm::PointerUnion<TypeDecl *, ExtensionDecl *> decl,
-                      unsigned index) const;
-
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -254,10 +262,105 @@ public:
   void cacheResult(DestructorDecl *value) const;
 };
 
-/// The zone number for name-lookup requests.
-#define SWIFT_NAME_LOOKUP_REQUESTS_TYPEID_ZONE 9
+class GenericParamListRequest :
+    public SimpleRequest<GenericParamListRequest,
+                         GenericParamList *(GenericContext *),
+                         CacheKind::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+  
+private:
+  friend SimpleRequest;
+  
+  // Evaluation.
+  llvm::Expected<GenericParamList *>
+  evaluate(Evaluator &evaluator, GenericContext *value) const;
+  
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+  Optional<GenericParamList *> getCachedResult() const;
+  void cacheResult(GenericParamList *value) const;
+};
 
-#define SWIFT_TYPEID_ZONE SWIFT_NAME_LOOKUP_REQUESTS_TYPEID_ZONE
+/// Expand the given ASTScope. Requestified to detect recursion.
+class ExpandASTScopeRequest
+    : public SimpleRequest<ExpandASTScopeRequest,
+                           ast_scope::ASTScopeImpl *(ast_scope::ASTScopeImpl *,
+                                                     ast_scope::ScopeCreator *),
+                           CacheKind::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  llvm::Expected<ast_scope::ASTScopeImpl *>
+  evaluate(Evaluator &evaluator, ast_scope::ASTScopeImpl *,
+           ast_scope::ScopeCreator *) const;
+
+public:
+  // Separate caching.
+  bool isCached() const;
+  Optional<ast_scope::ASTScopeImpl *> getCachedResult() const;
+  void cacheResult(ast_scope::ASTScopeImpl *) const {}
+};
+
+/// The input type for an unqualified lookup request.
+class UnqualifiedLookupDescriptor {
+  using LookupOptions = OptionSet<UnqualifiedLookupFlags>;
+
+public:
+  DeclName Name;
+  DeclContext *DC;
+  SourceLoc Loc;
+  LookupOptions Options;
+
+  UnqualifiedLookupDescriptor(DeclName name, DeclContext *dc,
+                              SourceLoc loc = SourceLoc(),
+                              LookupOptions options = {})
+      : Name(name), DC(dc), Loc(loc), Options(options) {}
+
+  friend llvm::hash_code hash_value(const UnqualifiedLookupDescriptor &desc) {
+    return llvm::hash_combine(desc.Name, desc.DC, desc.Loc,
+                              desc.Options.toRaw());
+  }
+
+  friend bool operator==(const UnqualifiedLookupDescriptor &lhs,
+                         const UnqualifiedLookupDescriptor &rhs) {
+    return lhs.Name == rhs.Name && lhs.DC == rhs.DC && lhs.Loc == rhs.Loc &&
+           lhs.Options.toRaw() == rhs.Options.toRaw();
+  }
+
+  friend bool operator!=(const UnqualifiedLookupDescriptor &lhs,
+                         const UnqualifiedLookupDescriptor &rhs) {
+    return !(lhs == rhs);
+  }
+};
+
+void simple_display(llvm::raw_ostream &out,
+                    const UnqualifiedLookupDescriptor &desc);
+
+SourceLoc extractNearestSourceLoc(const UnqualifiedLookupDescriptor &desc);
+
+/// Performs unqualified lookup for a DeclName from a given context.
+class UnqualifiedLookupRequest
+    : public SimpleRequest<UnqualifiedLookupRequest,
+                           LookupResult(UnqualifiedLookupDescriptor),
+                           CacheKind::Uncached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  llvm::Expected<LookupResult> evaluate(Evaluator &evaluator,
+                                        UnqualifiedLookupDescriptor desc) const;
+};
+
+#define SWIFT_TYPEID_ZONE NameLookup
 #define SWIFT_TYPEID_HEADER "swift/AST/NameLookupTypeIDZone.def"
 #include "swift/Basic/DefineTypeIDZone.h"
 #undef SWIFT_TYPEID_ZONE
@@ -268,14 +371,14 @@ template<typename Request>
 void reportEvaluatedRequest(UnifiedStatsReporter &stats,
                             const Request &request);
 
-#define SWIFT_TYPEID(RequestType)                                \
-template<>                                                       \
-inline void reportEvaluatedRequest(UnifiedStatsReporter &stats,  \
-                            const RequestType &request) {        \
-  ++stats.getFrontendCounters().RequestType;                     \
-}
+#define SWIFT_REQUEST(Zone, RequestType, Sig, Caching, LocOptions)             \
+  template <>                                                                  \
+  inline void reportEvaluatedRequest(UnifiedStatsReporter &stats,              \
+                                     const RequestType &request) {             \
+    ++stats.getFrontendCounters().RequestType;                                 \
+  }
 #include "swift/AST/NameLookupTypeIDZone.def"
-#undef SWIFT_TYPEID
+#undef SWIFT_REQUEST
 
 } // end namespace swift
 

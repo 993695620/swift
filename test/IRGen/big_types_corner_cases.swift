@@ -1,6 +1,7 @@
 // XFAIL: CPU=powerpc64le
 // RUN: %target-swift-frontend -enable-large-loadable-types %s -emit-ir | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-ptrsize
 // REQUIRES: optimized_stdlib
+// UNSUPPORTED: CPU=powerpc64le
 
 public struct BigStruct {
   var i0 : Int32 = 0
@@ -345,4 +346,12 @@ public extension sr8076_QueryHandler {
         }
         return try body(query)
     }
+}
+
+public func foo() -> Optional<(a: Int?, b: Bool, c: (Int?)->BigStruct?)> {
+  return nil
+}
+
+public func dontAssert() {
+  let _ = foo()
 }

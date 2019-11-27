@@ -11,8 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "SILFormat.h"
+#include "ModuleFile.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/Serialization/ModuleFile.h"
 #include "swift/Serialization/SerializedSILLoader.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -109,6 +109,9 @@ namespace swift {
     /// Get a reference to a local value with the specified ID and type.
     SILValue getLocalValue(serialization::ValueID Id,
                            SILType Type);
+
+    SILType getSILType(Type ty, SILValueCategory category,
+                       SILFunction *inContext);
 
     SILFunction *getFuncForReference(StringRef Name, SILType Ty);
     SILFunction *getFuncForReference(StringRef Name);

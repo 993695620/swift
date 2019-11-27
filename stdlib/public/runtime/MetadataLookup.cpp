@@ -55,11 +55,20 @@ using namespace reflection;
 template <class Base = Demangler>
 class DemanglerForRuntimeTypeResolution : public Base {
 public:
-  DemanglerForRuntimeTypeResolution() {
+  using Base::demangleSymbol;
+  using Base::demangleType;
+
+  // Force callers to explicitly pass `nullptr` to demangleSymbol or
+  // demangleType if they don't want to demangle symbolic references.
+  NodePointer demangleSymbol(StringRef symbolName) = delete;
+  NodePointer demangleType(StringRef typeName) = delete;
+
+  NodePointer demangleTypeRef(StringRef symbolName) {
     // Resolve symbolic references to type contexts into the absolute address of
     // the type context descriptor, so that if we see a symbolic reference in
     // the mangled name we can immediately find the associated metadata.
-    Base::setSymbolicReferenceResolver(ResolveAsSymbolicReference(*this));
+    return Base::demangleType(symbolName,
+                              ResolveAsSymbolicReference(*this));
   }
 };
 
@@ -249,8 +258,8 @@ static void _forEachTypeMetadataSectionAfter(
   }
 }
 
-void swift::addImageTypeMetadataRecordBlockCallback(const void *records,
-                                                    uintptr_t recordsSize) {
+void swift::addImageTypeMetadataRecordBlockCallbackUnsafe(
+    const void *records, uintptr_t recordsSize) {
   assert(recordsSize % sizeof(TypeMetadataRecord) == 0
          && "weird-sized type metadata section?!");
 
@@ -267,6 +276,12 @@ void swift::addImageTypeMetadataRecordBlockCallback(const void *records,
   // TypeMetadataRecords.
   _registerTypeMetadataRecords(TypeMetadataRecords.unsafeGetAlreadyInitialized(),
                                recordsBegin, recordsEnd);
+}
+
+void swift::addImageTypeMetadataRecordBlockCallback(const void *records,
+                                                    uintptr_t recordsSize) {
+  TypeMetadataRecords.get();
+  addImageTypeMetadataRecordBlockCallbackUnsafe(records, recordsSize);
 }
 
 void
@@ -296,7 +311,8 @@ _findExtendedTypeContextDescriptor(const ContextDescriptor *maybeExtension,
   Demangle::NodePointer &node = demangledNode ? *demangledNode : localNode;
 
   auto mangledName = extension->getMangledExtendedContext();
-  node = demangler.demangleType(mangledName);
+  node = demangler.demangleType(mangledName,
+                                ResolveAsSymbolicReference(demangler));
   if (!node)
     return nullptr;
   if (node->getKind() == Node::Kind::Type) {
@@ -702,20 +718,60 @@ _findContextDescriptorInCache(TypeMetadataPrivateState &T,
   return iter->getSecond();
 }
 
+#define DESCRIPTOR_MANGLING_SUFFIX_Structure Mn
+#define DESCRIPTOR_MANGLING_SUFFIX_Enum Mn
+#define DESCRIPTOR_MANGLING_SUFFIX_Protocol Mp
+
+#define DESCRIPTOR_MANGLING_SUFFIX_(X) X
+#define DESCRIPTOR_MANGLING_SUFFIX(KIND) \
+  DESCRIPTOR_MANGLING_SUFFIX_(DESCRIPTOR_MANGLING_SUFFIX_ ## KIND)
+
+#define DESCRIPTOR_MANGLING_(CHAR, SUFFIX) \
+  $sS ## CHAR ## SUFFIX
+#define DESCRIPTOR_MANGLING(CHAR, SUFFIX) DESCRIPTOR_MANGLING_(CHAR, SUFFIX)
+
+#define STANDARD_TYPE(KIND, MANGLING, TYPENAME) \
+  extern "C" const ContextDescriptor DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND));
+
+#if !SWIFT_OBJC_INTEROP
+# define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
+#endif
+
+#include "swift/Demangling/StandardTypesMangling.def"
+
 static const ContextDescriptor *
 _findContextDescriptor(Demangle::NodePointer node,
-                           Demangle::Demangler &Dem) {
-  const ContextDescriptor *foundContext = nullptr;
-  auto &T = TypeMetadataRecords.get();
-
-  // If we have a symbolic reference to a context, resolve it immediately.
+                       Demangle::Demangler &Dem) {
   NodePointer symbolicNode = node;
   if (symbolicNode->getKind() == Node::Kind::Type)
     symbolicNode = symbolicNode->getChild(0);
+
+  // If we have a symbolic reference to a context, resolve it immediately.
   if (symbolicNode->getKind() == Node::Kind::TypeSymbolicReference) {
     return cast<TypeContextDescriptor>(
       (const ContextDescriptor *)symbolicNode->getIndex());
   }
+
+  // Fast-path lookup for standard library type references with short manglings.
+  if (symbolicNode->getNumChildren() >= 2
+      && symbolicNode->getChild(0)->getKind() == Node::Kind::Module
+      && symbolicNode->getChild(0)->getText().equals("Swift")
+      && symbolicNode->getChild(1)->getKind() == Node::Kind::Identifier) {
+    auto name = symbolicNode->getChild(1)->getText();
+
+#define STANDARD_TYPE(KIND, MANGLING, TYPENAME) \
+    if (name.equals(#TYPENAME)) { \
+      return &DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND)); \
+    }
+#if !SWIFT_OBJC_INTEROP
+# define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
+#endif
+
+#include "swift/Demangling/StandardTypesMangling.def"
+  }
+  
+  const ContextDescriptor *foundContext = nullptr;
+  auto &T = TypeMetadataRecords.get();
 
   // Nothing to resolve if have a generic parameter.
   if (symbolicNode->getKind() == Node::Kind::DependentGenericParamType)
@@ -831,8 +887,8 @@ _registerProtocols(ProtocolMetadataPrivateState &C,
   C.SectionsToScan.push_back(ProtocolSection{begin, end});
 }
 
-void swift::addImageProtocolsBlockCallback(const void *protocols,
-                                           uintptr_t protocolsSize) {
+void swift::addImageProtocolsBlockCallbackUnsafe(const void *protocols,
+                                                 uintptr_t protocolsSize) {
   assert(protocolsSize % sizeof(ProtocolRecord) == 0 &&
          "protocols section not a multiple of ProtocolRecord");
 
@@ -846,6 +902,12 @@ void swift::addImageProtocolsBlockCallback(const void *protocols,
   // Conformance cache should always be sufficiently initialized by this point.
   _registerProtocols(Protocols.unsafeGetAlreadyInitialized(),
                      recordsBegin, recordsEnd);
+}
+
+void swift::addImageProtocolsBlockCallback(const void *protocols,
+                                           uintptr_t protocolsSize) {
+  Protocols.get();
+  addImageProtocolsBlockCallbackUnsafe(protocols, protocolsSize);
 }
 
 void swift::swift_registerProtocols(const ProtocolRecord *begin,
@@ -926,36 +988,6 @@ public:
   static size_t getExtraAllocationSize(Args &&... ignored) {
     return 0;
   }
-};
-
-class StaticFieldSection {
-  const void *Begin;
-  const void *End;
-
-public:
-  StaticFieldSection(const void *begin, const void *end)
-      : Begin(begin), End(end) {}
-
-  FieldDescriptorIterator begin() const {
-    return FieldDescriptorIterator(Begin, End);
-  }
-
-  FieldDescriptorIterator end() const {
-    return FieldDescriptorIterator(End, End);
-  }
-};
-
-class DynamicFieldSection {
-  const FieldDescriptor **Begin;
-  const FieldDescriptor **End;
-
-public:
-  DynamicFieldSection(const FieldDescriptor **fields, size_t size)
-      : Begin(fields), End(fields + size) {}
-
-  const FieldDescriptor **begin() const { return Begin; }
-
-  const FieldDescriptor **end() const { return End; }
 };
 
 } // namespace
@@ -1628,7 +1660,7 @@ static TypeInfo swift_getTypeByMangledNameImpl(
     node = classNode;
   } else {
     // Demangle the type name.
-    node = demangler.demangleType(typeName);
+    node = demangler.demangleTypeRef(typeName);
     if (!node)
       return TypeInfo();
   }
@@ -1659,6 +1691,26 @@ swift_getTypeByMangledNameInEnvironment(
 
 SWIFT_CC(swift) SWIFT_RUNTIME_EXPORT
 const Metadata * _Nullable
+swift_getTypeByMangledNameInEnvironmentInMetadataState(
+                        size_t metadataState,
+                        const char *typeNameStart,
+                        size_t typeNameLength,
+                        const TargetGenericEnvironment<InProcess> *environment,
+                        const void * const *genericArgs) {
+  llvm::StringRef typeName(typeNameStart, typeNameLength);
+  SubstGenericParametersFromMetadata substitutions(environment, genericArgs);
+  return swift_getTypeByMangledName((MetadataState)metadataState, typeName,
+    genericArgs,
+    [&substitutions](unsigned depth, unsigned index) {
+      return substitutions.getMetadata(depth, index);
+    },
+    [&substitutions](const Metadata *type, unsigned index) {
+      return substitutions.getWitnessTable(type, index);
+    }).getMetadata();
+}
+
+SWIFT_CC(swift) SWIFT_RUNTIME_EXPORT
+const Metadata * _Nullable
 swift_getTypeByMangledNameInContext(
                         const char *typeNameStart,
                         size_t typeNameLength,
@@ -1667,6 +1719,26 @@ swift_getTypeByMangledNameInContext(
   llvm::StringRef typeName(typeNameStart, typeNameLength);
   SubstGenericParametersFromMetadata substitutions(context, genericArgs);
   return swift_getTypeByMangledName(MetadataState::Complete, typeName,
+    genericArgs,
+    [&substitutions](unsigned depth, unsigned index) {
+      return substitutions.getMetadata(depth, index);
+    },
+    [&substitutions](const Metadata *type, unsigned index) {
+      return substitutions.getWitnessTable(type, index);
+    }).getMetadata();
+}
+
+SWIFT_CC(swift) SWIFT_RUNTIME_EXPORT
+const Metadata * _Nullable
+swift_getTypeByMangledNameInContextInMetadataState(
+                        size_t metadataState,
+                        const char *typeNameStart,
+                        size_t typeNameLength,
+                        const TargetContextDescriptor<InProcess> *context,
+                        const void * const *genericArgs) {
+  llvm::StringRef typeName(typeNameStart, typeNameLength);
+  SubstGenericParametersFromMetadata substitutions(context, genericArgs);
+  return swift_getTypeByMangledName((MetadataState)metadataState, typeName,
     genericArgs,
     [&substitutions](unsigned depth, unsigned index) {
       return substitutions.getMetadata(depth, index);
@@ -1757,8 +1829,8 @@ getObjCClassByMangledName(const char * _Nonnull typeName,
         return nullptr;
       }).getMetadata();
   } else {
-    metadata = swift_getTypeByMangledNameInEnvironment(
-      typeStr.data(), typeStr.size(), /* no substitutions */ nullptr, nullptr);
+    metadata = swift_stdlib_getTypeByMangledNameUntrusted(typeStr.data(),
+                                                          typeStr.size());
   }
   if (metadata) {
     auto objcClass =
@@ -1979,7 +2051,7 @@ SubstGenericParametersFromWrittenArgs::getWitnessTable(const Metadata *type,
 /// will be returned as (depth, index).
 static Optional<std::pair<unsigned, unsigned>>
 demangleToGenericParamRef(StringRef typeName) {
-  Demangler demangler;
+  StackAllocatedDemangler<1024> demangler;
   NodePointer node = demangler.demangleType(typeName);
   if (!node)
     return None;
@@ -1999,6 +2071,8 @@ void swift::gatherWrittenGenericArgs(
                              const TypeContextDescriptor *description,
                              SmallVectorImpl<const Metadata *> &allGenericArgs,
                              Demangler &BorrowFrom) {
+  if (!description)
+    return;
   auto generics = description->getGenericContext();
   if (!generics)
     return;

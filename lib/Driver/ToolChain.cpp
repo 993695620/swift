@@ -52,8 +52,12 @@ ToolChain::JobContext::getTemporaryFilePath(const llvm::Twine &name,
   SmallString<128> buffer;
   std::error_code EC = llvm::sys::fs::createTemporaryFile(name, suffix, buffer);
   if (EC) {
+    // Use the constructor that prints both the error code and the description.
     // FIXME: This should not take down the entire process.
-    llvm::report_fatal_error("unable to create temporary file for filelist");
+    auto error = llvm::make_error<llvm::StringError>(
+        EC,
+        "- unable to create temporary file for " + name + "." + suffix);
+    llvm::report_fatal_error(std::move(error));
   }
 
   C.addTemporaryFile(buffer.str(), PreserveOnSignal::Yes);
@@ -233,6 +237,9 @@ bool ToolChain::jobIsBatchable(const Compilation &C, const Job *A) const {
     return false;
   auto const *CJActA = dyn_cast<const CompileJobAction>(&A->getSource());
   if (!CJActA)
+    return false;
+  // At present the Frontend cannot provide unparsedRanges in batch mode:
+  if (!A->getOutput().getAnyOutputForType(file_types::TY_SwiftRanges).empty())
     return false;
   return findSingleSwiftInput(CJActA) != nullptr;
 }

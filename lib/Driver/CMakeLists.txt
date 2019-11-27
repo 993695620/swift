@@ -3,7 +3,9 @@ set(swiftDriver_sources
   Compilation.cpp
   DarwinToolChains.cpp
   DependencyGraph.cpp
+  SourceComparator.cpp
   Driver.cpp
+  DriverIncrementalRanges.cpp
   ExperimentalDependencyDriverGraph.cpp
   FrontendUtil.cpp
   Job.cpp
@@ -62,4 +64,5 @@ if(SWIFT_BUILD_STATIC_STDLIB)
     endif()
   endforeach()
   add_custom_target(swift_static_lnk_args ALL DEPENDS ${static_stdlib_lnk_file_list})
+  add_dependencies(stdlib swift_static_lnk_args)
 endif()
